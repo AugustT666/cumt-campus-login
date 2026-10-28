@@ -137,6 +137,12 @@ def main():
         assert page.locator('#login-button').is_disabled()
         assert page.locator('#logout-button').is_disabled()
         assert page.locator('#status-refresh').is_disabled()
+        page.evaluate("window.fakeState.campus=true;window.fakeState.session_conflict=true;window.fakeState.session_state='unknown';refresh()")
+        assert page.locator('#session-recovery').is_visible()
+        assert page.locator('#session-recovery').get_attribute('href')=='http://202.119.196.6:8080/Self/dashboard'
+        assert page.locator('#session-recovery').get_attribute('target')=='_blank'
+        page.evaluate("window.fakeState.session_conflict=false;refresh()")
+        assert page.locator('#session-recovery').is_hidden()
         assert page.locator('#save-profile').is_disabled()
         page.evaluate('toggleLogin();logoutSession();refreshStatus();saveProfile()')
         assert page.evaluate("window.fakeLog.filter(x=>x[0]==='login').length")==1

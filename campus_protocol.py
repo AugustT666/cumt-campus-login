@@ -657,6 +657,17 @@ class Engine:
                 result['detail'] = 'unrecognized_status_response'
             else:
                 evidence = _result(data)
+                # Keep evidence and normalization diagnostics without retaining
+                # malformed raw MAC values or treating an IP echo as identity.
+                result['server_reported_online']=evidence
+                result['server_mac_fields']={key:{'present':key in data,
+                    'value_type':type(data.get(key)).__name__,
+                    'text_length':len(data[key]) if isinstance(data.get(key),str) else None,
+                    'valid':bool(_session_mac(data.get(key)))} for key in ('olmac','ss4')}
+                result['requester_ip_fields']={key:{'present':key in data,
+                    'valid':bool(_session_ip(data.get(key))),
+                    'matches_current':_session_ip(data.get(key))==self.wifi.ip}
+                    for key in ('v46ip','ss5','v4ip')}
                 if evidence is True:
                     result['online_account'] = _session_account(data.get('uid'))
                     base=result['online_account'].split('@',1)[0]

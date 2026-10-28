@@ -158,6 +158,7 @@ class App:
         self.auth_diagnostic={}
         self.session_diagnostic={}
         self.network_diagnostic={}
+        self.unconfirmed_connectivity={}
         self.session_state='unknown'
         self.online_account=''
         self.identity_source=''
@@ -269,6 +270,8 @@ class App:
                     'student':self.wifi.student,'busy':self.busy,'operation':self.operation,
                     'logged_in':self.logged_in,'status':self.status,'pending_host':self.pending_host,
                     'session_state':getattr(self,'session_state','unknown'),
+                    'session_conflict':(getattr(self,'session_checked_key',None)==self.wifi.key
+                        and self.session_binding_conflict(getattr(self,'session_diagnostic',{}))),
                     'online_account':getattr(self,'online_account','') if getattr(self,'session_state','unknown')=='online' else '',
                     'identity_source':getattr(self,'identity_source',''),
                     'session_binding':getattr(self,'session_diagnostic',{}).get('binding','unconfirmed'),
@@ -324,14 +327,21 @@ class App:
             if announce:
                 self.message({'online':'当前无线网已登录，可直接注销',
                               'offline':'当前无线网未登录',
-                              'unknown':self.status_failure_message(report,'暂时无法确认登录状态，请排查后刷新。')
-                                        if report.get('network_error') else
-                                        '暂时无法确认登录状态，可刷新或手动登录'}[self.session_state])
+                              'unknown':self.status_failure_message(report,'暂时无法确认登录状态，请先刷新。')}[self.session_state])
+
+    @staticmethod
+    def session_binding_conflict(report):
+        return (isinstance(report,dict) and report.get('state')=='unknown'
+                and (report.get('binding')=='conflict' or report.get('detail') in
+                     ('session_ip_mismatch','session_mac_mismatch','status_ip_mismatch')))
 
     @staticmethod
     def status_failure_message(report,fallback):
         error=report.get('network_error')
         detail=error.get('message','') if isinstance(error,dict) else ''
+        if App.session_binding_conflict(report):
+            detail=('学校返回的设备会话信息与本机不一致。请打开“自助服务”核对本人的在线设备，'
+                    '如有本人的旧连接，可下线后再刷新状态。')
         return (str(detail)+' '+fallback).strip() if detail else fallback
 
     def refresh_status(self):
@@ -408,6 +418,32 @@ class App:
                 if self.closed.is_set() or self.busy or not self.logged_in or self.auth_key!=wifi.key:
                     return
                 self.message('已登录，网络连接正常' if result['online'] else '已登录，外网连接尚未确认')
+        threading.Thread(target=run,daemon=True).start()
+
+    def check_unconfirmed_internet_later(self,wifi,tec):
+        """Record connectivity separately from an unconfirmed device session."""
+        operation_id=getattr(self,'operation_id','')
+        def current_operation():
+            with self.lock:
+                if (self.closed.is_set() or self.cancel.is_set()
+                        or getattr(self,'operation_id','')!=operation_id or self.wifi.key!=wifi.key):
+                    raise RuntimeError('本次网络探测已停止或结果已过期。')
+                return self.checked_wifi(wifi,tec)
+        def run():
+            try:
+                current_operation()
+                with core.trace_scope(lambda event,level='DEBUG',**fields:
+                        self.record(event,level=level,operation_id=operation_id,**fields)):
+                    result=core.internet_check(wifi,reader=current_operation,allow_tec=tec)
+                with self.lock:
+                    current_operation()
+                    self.unconfirmed_connectivity={'operation_id':operation_id,
+                        'checked_at':dt.datetime.now().isoformat(timespec='seconds'),
+                        'authentication_accepted':True,'result':result}
+                    self.record('internet.unconfirmed_result',operation_id=operation_id,result=result)
+            except Exception as exc:
+                self.record('internet.unconfirmed_check_error',level='WARNING',
+                            operation_id=operation_id,_exception=exc)
         threading.Thread(target=run,daemon=True).start()
 
     def startup_enabled(self):
@@ -616,6 +652,7 @@ class App:
             self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'checking_status',
                                   'authentication_requests':0}
             with self.lock:
+                self.unconfirmed_connectivity={}
                 self.wifi=wifi
                 self.settings['operator']=operator
                 self.store.write_settings(self.settings)
@@ -628,6 +665,12 @@ class App:
                 self.message('服务器报告当前无线网已在线；如需更换账号，请先注销')
                 return
             network_error=report.get('network_error') or {}
+            if self.session_binding_conflict(report):
+                self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'session_conflict',
+                                      'authentication_requests':0}
+                self.record('authentication.preflight_blocked',diagnostic=self.auth_diagnostic)
+                self.message(self.status_failure_message(report,'本次未发送登录请求。'))
+                return
             if report.get('state')=='unknown' and network_error.get('code')=='permission_denied':
                 self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'network_blocked',
                                       'authentication_requests':0,'network_error':dict(network_error)}
@@ -649,6 +692,7 @@ class App:
             core.guard(wifi,core.read_wifi(),tec)
             if self.cancel.is_set() or self.closed.is_set(): raise RuntimeError('本次登录已停止。')
             if result is True:
+                self.auth_diagnostic['request_accepted']=True
                 # Request acceptance and a live session are separate facts.
                 report={'state':'unknown','detail':'post_login_status_unconfirmed'}
                 try:
@@ -666,6 +710,8 @@ class App:
                             if self.session_state=='offline' else
                             '服务器已接受登录，在线状态尚未确认；请稍后刷新状态，未再次提交。')
                     self.message(self.status_failure_message(report,detail))
+                    if self.session_binding_conflict(report):
+                        self.check_unconfirmed_internet_later(wifi,tec)
             elif result is False:
                 # A rejected request does not prove that this device is offline:
                 # the server can reject a second login while it is already online.
@@ -723,7 +769,9 @@ class App:
                 self.message('当前无线网未登录，无需注销')
                 return
             if report.get('state')!='online':
-                self.message(self.status_failure_message(report,'未确认当前登录状态，请刷新状态后再注销'))
+                self.record('logout.preflight_blocked',state=report.get('state'),
+                            reason=report.get('detail','status_unconfirmed'),authentication_requests=0)
+                self.message(self.status_failure_message(report,'未确认当前登录状态，本次未发送注销请求；请先刷新状态后再注销。'))
                 return
             def check_allowed():
                 self.checked_wifi(wifi,tec)
@@ -807,6 +855,7 @@ class App:
             if not current.campus or (previous.campus and current.guid!=previous.guid):
                 self.auto_attempted=False
             if current.key!=previous.key:
+                self.unconfirmed_connectivity={}
                 self.record('network.changed',previous=core.asdict(previous),current=core.asdict(current))
                 self.portal_key=None
                 self.pending_host=''
@@ -994,6 +1043,7 @@ class App:
               'messages':list(self.messages),'network_configuration_changes':False}
         data['authentication']=self.auth_diagnostic
         data['network_check']=getattr(self,'network_diagnostic',{})
+        data['unconfirmed_connectivity']=getattr(self,'unconfirmed_connectivity',{})
         data['session']={'state':self.session_state,'checked_at':self.session_checked_at,
                          'query':self.session_diagnostic}
         data['last_job_elapsed_ms']=self.last_job_elapsed_ms
