@@ -200,7 +200,7 @@ def main():
     archive = CArchiveReader(str(exe))
     pyz = archive.open_embedded_archive('PYZ.pyz')
     files = list(archive.toc)
-    assert all(module in pyz.toc for module in ('campus_core', 'campus_protocol', 'campus_logging', 'campus_network'))
+    assert all(module in pyz.toc for module in ('campus_core', 'campus_protocol', 'campus_logging', 'campus_network', 'campus_selfservice'))
     normalized = {name.replace('\\', '/'): name for name in files}
     assert 'campus_ui.html' in normalized
     bundled_assets = {}

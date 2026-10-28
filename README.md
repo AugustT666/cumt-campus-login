@@ -6,15 +6,15 @@
 
 用于中国矿业大学校园 WiFi 的 Windows 登录工具，支持保存多个账号、登录、注销和连接后自动弹出。
 
-**当前版本：v1.7.5，约 10.85 MB。**
+**当前版本：v1.7.6，约 10.88 MB。**
 
-[下载 Windows 版](https://github.com/AugustT666/cumt-campus-login/releases/tag/v1.7.5) · [更新记录](CHANGELOG.md)
+[下载 Windows 版](https://github.com/AugustT666/cumt-campus-login/releases/tag/v1.7.6) · [更新记录](CHANGELOG.md)
 
 ## 下载与运行
 
 支持 Windows 10 / 11，需要系统已安装 WebView2 Runtime，通常系统已自带无需额外安装。
 
-在下载页选择 `cumt-campus-login-v1.7.5.exe`，下载后直接打开，无需安装 Python。
+在下载页选择 `cumt-campus-login-v1.7.6.exe`，下载后直接打开，无需安装 Python。
 
 目前提供 Windows 版，Mac 和 Linux 版计划中。
 
@@ -40,10 +40,10 @@
 - 登录失败时先核对账号和所选登录网络，并留意程序中的认证时段提示。
 - 若提示系统拒绝连接，可检查安全软件的出站权限；如正在使用 Tailscale Exit Node、其他 VPN 或代理，也可尝试暂时停用后重试，未使用则跳过。
 - 若提示设备会话信息不一致，可点击窗口底部的“自助服务”核对本人的在线设备，必要时下线后刷新。
-- 注销失败时，可到[校园网自助服务](http://202.119.196.6:8080/Self/dashboard)下线，再回来刷新状态。
+- 教师网注销优先通过学校自助服务精准下线本机，不会批量下线其他设备。需要验证码或无法核对设备时，可到[校园网自助服务](http://202.119.196.6:8080/Self/dashboard)下线，再回来刷新状态。
 
 ## 账号与隐私
 
-保存的账号密码在本机由当前 Windows 用户加密保护。实际登录时，账号密码会提交给校园认证服务器。
+保存的账号密码在本机由当前 Windows 用户加密保护。登录及自助下线时，必要信息只提交给学校的认证或自助服务。
 
 请仅在自己的 Windows 账户中保存账号。
