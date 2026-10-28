@@ -2,7 +2,7 @@
 
 ## 版本与环境
 
-本快照对应 v1.7.5。版本用途及分支约定见 [版本说明](1.7.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
+当前版本为 v1.7.6。版本用途及分支约定见 [版本说明](VERSIONS.md)。日常改进以 `main` 为起点。
 
 需要 Windows、Python 3.12 和 WebView2 Runtime。v1.6.4 的门户兼容还需要系统已有 Edge 或 Chrome；当前 Windows 生产包使用独立 WebView2 控件。
 
@@ -13,6 +13,12 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe campus_app.py
 ```
+
+## TEC 注销
+
+注销前刷新当前连接的门户接入设备参数，并通过自助服务核对本机状态，必要时精准下线本机对应的单一会话。不会批量下线账号下的其他设备。
+
+只有自助服务设备列表和认证状态均持续确认离线，才显示已下线。出现验证码或无法唯一核对设备时停止自动处理；会话重新出现时明确提示，不重复下线。操作结束后退出自助网页会话。
 
 ## 自动化检查
 

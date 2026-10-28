@@ -19,6 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 import campus_core as core
 import campus_protocol as protocol
 import campus_network
+import campus_selfservice as selfservice
 from campus_logging import RuntimeLog
 
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
@@ -28,6 +29,15 @@ APP_USER_MODEL_ID = 'AugustT666.CumtCampusLogin' + ('.Experimental' if EXPERIMEN
 STARTUP_VALUE_NAME = 'CumtCampusLoginExperimental' if EXPERIMENTAL else 'CumtCampusLogin'
 STABLE_STARTUP_VALUE_NAME = 'CumtCampusLogin'
 STABLE_INSTANCE_MUTEX = r'Local\CumtCampusLoginDesktopV1'
+LOGOUT_ROUTE_TTL = 300.0
+LOGOUT_AUTO_HOLD = 60.0
+LOGOUT_CONFIRM_TIMEOUT = 20.0
+LOGOUT_STABLE_SECONDS = 5.0
+LOGOUT_SESSION_LOOKUP_TIMEOUT = 45.0
+
+
+class LogoutContextUnavailable(RuntimeError):
+    """No verified AC route is available; no portal logout was submitted."""
 
 
 def stable_autostart_configured():
@@ -159,6 +169,9 @@ class App:
         self.session_diagnostic={}
         self.network_diagnostic={}
         self.unconfirmed_connectivity={}
+        self.logout_diagnostic={}
+        self._logout_watch=None
+        self._logout_recovery_needed=False
         self.session_state='unknown'
         self.online_account=''
         self.identity_source=''
@@ -272,6 +285,7 @@ class App:
                     'session_state':getattr(self,'session_state','unknown'),
                     'session_conflict':(getattr(self,'session_checked_key',None)==self.wifi.key
                         and self.session_binding_conflict(getattr(self,'session_diagnostic',{}))),
+                    'logout_recovery_needed':bool(getattr(self,'_logout_recovery_needed',False)),
                     'online_account':getattr(self,'online_account','') if getattr(self,'session_state','unknown')=='online' else '',
                     'identity_source':getattr(self,'identity_source',''),
                     'session_binding':getattr(self,'session_diagnostic',{}).get('binding','unconfirmed'),
@@ -281,12 +295,94 @@ class App:
                                               and student_auth_time_notice(self.wifi)),
                     'logging_error':(str(log.write_error) or getattr(log,'location_warning','')) if log is not None else ''}
 
-    def session_engine(self,wifi,tec,discover=False):
+    @staticmethod
+    def _portal_network_context(wifi):
+        # Wifi.key intentionally remains compatible with existing session/UI
+        # code. Routing also depends on the NIC MAC and current gateway.
+        mac=re.sub(r'[-:]','',str(wifi.mac or '')).strip().casefold()
+        return (wifi.key,mac,str(wifi.gateway or ''))
+
+    def _invalidate_logout_route(self,reason):
+        with self.lock:
+            self._portal_route_generation=getattr(self,'_portal_route_generation',0)+1
+            self._verified_logout_route=None
+            self.portal_key=None
+            self._portal_discovered=False
+            self._engine=None
+            self.record('portal.route_invalidated',reason=reason,
+                        generation=self._portal_route_generation)
+
+    def _observe_portal_network(self,wifi):
+        with self.lock:
+            context=self._portal_network_context(wifi)
+            previous=getattr(self,'_observed_portal_network',None)
+            if previous is not None and previous!=context:
+                self._invalidate_logout_route('network_context_changed')
+            self._observed_portal_network=context
+            return (context,getattr(self,'_portal_route_generation',0))
+
+    def _assert_portal_route(self,wifi,expected):
+        with self.lock:
+            if (self._portal_network_context(wifi),getattr(self,'_portal_route_generation',0))!=expected:
+                raise RuntimeError('无线连接上下文已改变，已停止本次操作；未重用旧接入设备参数。')
+
+    @staticmethod
+    def _rich_ac_fields(plan):
+        return bool(str(plan.get('ac_name') or '').strip()
+                    or protocol._session_ip(plan.get('ac_ip')))
+
+    @staticmethod
+    def _logout_discovery_hint(hint):
+        if not hint:
+            return ''
+        core.portal_origin(hint)
+        parts=urlsplit(hint)
+        routing={'wlanacip','acip','wlanacname','sysname','vlan','vlanid'}
+        pairs=[(key,value) for key,value in core.parse_qsl(parts.query,keep_blank_values=True)
+               if key.casefold() not in routing]
+        return urlunsplit((parts.scheme,parts.netloc,parts.path,core.urlencode(pairs),''))
+
+    def _current_logout_route(self,wifi):
+        with self.lock:
+            cached=getattr(self,'_verified_logout_route',None)
+            if not isinstance(cached,dict):
+                return None
+            token=(self._portal_network_context(wifi),getattr(self,'_portal_route_generation',0))
+            age=time.monotonic()-cached['checked_at']
+            hint_hash=hashlib.sha256(str(self.settings.get('portal_hint','')).encode('utf-8')).hexdigest()
+            if (cached.get('context')!=token or not 0<=age<=LOGOUT_ROUTE_TTL
+                    or cached.get('hint_hash')!=hint_hash or self.portal_key!=wifi.key
+                    or not getattr(self,'_portal_discovered',False)):
+                self._verified_logout_route=None
+                return None
+            return cached
+
+    def session_engine(self,wifi,tec,discover=False,for_logout=False):
         """Cache no credentials; a new connection/IP always gets fresh context."""
+        with self.lock:
+            if getattr(self,'notifications',None):
+                self.consume_notifications()
+        token=self._observe_portal_network(wifi)
+        hint=self.settings.get('portal_hint','')
+        if for_logout:
+            cached=self._current_logout_route(wifi)
+            if cached:
+                self.portal=core.fresh_url(cached['portal'],wifi)
+                self.portal_key=wifi.key
+                self._portal_discovered=True
+            elif tec:
+                # While already online, public probes can return no captive
+                # redirect. A bare page is not proof of the correct NAS route.
+                discover=True
+                self.portal_key=None
+                self._portal_discovered=False
+                self._engine=None
+                hint=self._logout_discovery_hint(hint)
         if discover and (self.portal_key!=wifi.key or not getattr(self,'_portal_discovered',False)):
             self.record('portal.discovery_started',wifi=core.asdict(wifi))
-            portal,_=core.discover(wifi,self.settings.get('portal_hint',''),
+            portal,_=core.discover(wifi,hint,
                                    reader=lambda:self.checked_wifi(wifi,tec),allow_tec=tec)
+            self._assert_portal_route(wifi,token)
             self.portal=portal
             self.portal_key=wifi.key
             self._portal_discovered=True
@@ -304,7 +400,11 @@ class App:
             raise RuntimeError('请确认新的认证服务器地址')
         engine=getattr(self,'_engine',None)
         if engine is None or engine.wifi.key!=wifi.key or engine.portal!=self.portal:
-            engine=protocol.Engine(wifi,self.portal,reader=lambda:self.checked_wifi(wifi,tec),allow_tec=tec)
+            def current_route():
+                current=self.checked_wifi(wifi,tec)
+                self._assert_portal_route(wifi,token)
+                return current
+            engine=protocol.Engine(wifi,self.portal,reader=current_route,allow_tec=tec)
             self._engine=engine
         return engine
 
@@ -324,7 +424,18 @@ class App:
             self.session_checked_at=dt.datetime.now().strftime('%H:%M:%S')
             self.session_diagnostic=dict(report)
             self.record('session.result',wifi=core.asdict(wifi),result=report)
+            if self.session_state=='offline' and self._logout_auto_suppressed(wifi):
+                self._logout_watch['saw_offline']=True
             if announce:
+                if self.session_state=='online' and self._logout_auto_suppressed(wifi):
+                    self._logout_recovery_needed=True
+                    reappeared=self._logout_watch.get('saw_offline',False)
+                    self.logout_diagnostic['outcome']='session_reappeared' if reappeared else 'still_online'
+                    self.record('logout.session_reappeared',elapsed_ms=round(
+                        (time.monotonic()-self._logout_watch['started'])*1000))
+                    self.message(('注销后服务器再次报告本机在线' if reappeared else '注销仍未确认，服务器继续报告本机在线')
+                                 +'，本程序未重新登录；请从“自助服务”核对本机会话。')
+                    return
                 self.message({'online':'当前无线网已登录，可直接注销',
                               'offline':'当前无线网未登录',
                               'unknown':self.status_failure_message(report,'暂时无法确认登录状态，请先刷新。')}[self.session_state])
@@ -377,16 +488,39 @@ class App:
         return self.start_job('network_check',job)
 
     def run_authentication(self,wifi,account,password,operator,operation,tec,check_allowed):
-        # An online status response already identifies this portal for logout;
-        # probing public captive URLs while online adds delays and no context.
-        engine=self.session_engine(wifi,tec,discover=operation=='login')
+        engine=self.session_engine(wifi,tec,discover=operation=='login',for_logout=operation=='logout')
+        token=(self._portal_network_context(wifi),getattr(self,'_portal_route_generation',0))
+        def guarded_submit():
+            check_allowed()
+            self._assert_portal_route(wifi,token)
         try:
             began=time.perf_counter()
-            engine.prepare()
+            if operation=='logout' and tec:
+                try:
+                    route=protocol._portal_parameters(engine.portal)
+                    rich=self._rich_ac_fields({'ac_name':route.get('wlanacname'),
+                                              'ac_ip':route.get('wlanacip')})
+                except (ValueError,protocol.UnsupportedPortal):
+                    rich=False
+                if not rich:
+                    self.auth_diagnostic={'operation':'logout','backend':'status_only',
+                        'phase':'logout_context_missing','authentication_requests':0}
+                    raise LogoutContextUnavailable('当前教师网缺少可核验的接入设备参数，未发送门户注销请求。')
+            plan=engine.prepare()
+            guarded_submit()
+            if operation=='logout' and tec and str(plan.get('login_method'))=='1' and not self._rich_ac_fields(plan):
+                self.auth_diagnostic={'operation':'logout','backend':'status_only',
+                    'phase':'logout_context_missing','authentication_requests':0}
+                raise LogoutContextUnavailable('当前教师网缺少可核验的接入设备参数，未发送门户注销请求。')
+            if self._rich_ac_fields(plan):
+                with self.lock:
+                    self._assert_portal_route(wifi,token)
+                    self._verified_logout_route={'context':token,'portal':engine.portal,
+                        'checked_at':time.monotonic(),'hint_hash':hashlib.sha256(
+                            str(self.settings.get('portal_hint','')).encode('utf-8')).hexdigest()}
             self.record('authentication.plan_ready',backend='verified_drcom_http',operation=operation,
                         elapsed_ms=round((time.perf_counter()-began)*1000))
-            check_allowed()
-            result,trace=engine.authenticate(account,password,operator,operation,before_submit=check_allowed)
+            result,trace=engine.authenticate(account,password,operator,operation,before_submit=guarded_submit)
         except protocol.UnsupportedPortal as exc:
             self.record_exception('authentication.browser_fallback',exc,operation=operation)
             # A fallback is allowed only before any authentication request.
@@ -609,6 +743,9 @@ class App:
             return self._login(account,password,operator,profile_id,automatic,expected,quiet_override)
 
     def _login(self,account,password,operator,profile_id='',automatic=False,expected=None,quiet_override=False):
+        if not automatic:
+            self._logout_watch=None
+            self._logout_recovery_needed=False
         self.register_secrets(str(account),str(password))
         self.record('login.requested',operator=operator,automatic=automatic)
         account=str(account).strip()
@@ -621,6 +758,8 @@ class App:
             wifi,tec=self.permitted(logout=True)
             if automatic and (not wifi.campus or not self.stu_automation_enabled()):
                 return {'ok':False,'message':'自动登录已停止。'}
+            if automatic and self._logout_auto_suppressed(wifi):
+                return {'ok':False,'message':'刚请求注销，已停止本次自动登录。'}
             if automatic:
                 try:
                     self._ensure_exclusive_auto()
@@ -749,9 +888,153 @@ class App:
         if self.closed.is_set() or self.cancel.is_set(): raise RuntimeError('本次操作已停止。')
         if getattr(self,'auto_job',False):
             self._ensure_exclusive_auto()
-        current=core.read_wifi()
-        core.guard(wifi,current,tec)
+        try:
+            current=core.read_wifi()
+        except (OSError,RuntimeError):
+            self._invalidate_logout_route('wifi_read_unavailable')
+            raise
+        try:
+            core.guard(wifi,current,tec)
+        except RuntimeError:
+            self._observe_portal_network(current)
+            raise
+        if self._portal_network_context(wifi)!=self._portal_network_context(current):
+            self._observe_portal_network(current)
+            raise RuntimeError('无线设备或网关参数已改变，已停止本次操作；未重用旧接入设备参数。')
+        self._observe_portal_network(current)
         return current
+
+    def _logout_auto_suppressed(self,wifi):
+        watch=getattr(self,'_logout_watch',None)
+        return bool(watch and 0<=time.monotonic()-watch['started']<LOGOUT_AUTO_HOLD
+                    and wifi.ssid.casefold()==watch['ssid'] and wifi.guid==watch['guid'])
+
+    def _logout_wait(self,seconds):
+        self.cancel.wait(seconds)
+
+    @staticmethod
+    def _service_account(account):
+        account=str(account).strip()
+        if account.startswith(',0,'):
+            account=account[3:]
+        head,separator,suffix=account.rpartition('@')
+        if separator and suffix.casefold() in ('telecom','unicom','cmcc','campus'):
+            account=head
+        return account
+
+    def _logout_credentials(self,report):
+        if report.get('state')!='online':
+            selected=self.store.selected_profile()
+            if (isinstance(selected,dict) and isinstance(selected.get('account'),str) and selected['account'].strip()
+                    and isinstance(selected.get('password'),str) and selected['password']):
+                return self._service_account(selected['account']),selected['password']
+            raise RuntimeError('当前会话未确认，且没有选中的已保存账号；未自动提交账号密码。')
+        identity=self._service_account(report.get('online_account','')).casefold()
+        if not identity:
+            raise RuntimeError('服务器未提供可核对的在线账号，请在自助服务手动确认；未自动提交密码。')
+        selected=self.store.selected_profile()
+        if (isinstance(selected,dict) and self._service_account(selected.get('account','')).casefold()==identity
+                and isinstance(selected.get('password'),str) and selected['password']):
+            return self._service_account(selected['account']),selected['password']
+        data=self.store.profiles()
+        profiles=data.get('profiles',[]) if isinstance(data,dict) else []
+        matches={(self._service_account(p.get('account','')),p.get('password')) for p in profiles
+                 if isinstance(p,dict) and self._service_account(p.get('account','')).casefold()==identity
+                 and isinstance(p.get('password'),str) and p['password']}
+        if len(matches)!=1:
+            raise RuntimeError('未找到当前在线账号对应的唯一已保存密码，请从自助服务手动处理。')
+        return next(iter(matches))
+
+    def _confirm_tec_logout(self,wifi,client,check_allowed):
+        deadline=time.monotonic()+LOGOUT_CONFIRM_TIMEOUT
+        stable_since=None
+        last={'state':'unknown','detail':'logout_not_confirmed'}
+        samples=0
+        target_mac=protocol._session_mac(wifi.mac)
+        while True:
+            check_allowed()
+            last=self.session_engine(wifi,True).status()
+            self.apply_session(wifi,last)
+            devices=client.list_online_devices()
+            absent=not any(d.mac==target_mac for d in devices)
+            samples+=1
+            now=time.monotonic()
+            self.logout_diagnostic['verification']={'samples':samples,
+                'portal_state':last.get('state'),'account_device_absent':absent}
+            if absent and last.get('state')=='offline':
+                if stable_since is None:stable_since=now
+                if now-stable_since>=LOGOUT_STABLE_SECONDS:
+                    return True,last
+            else:
+                stable_since=None
+            if now>=deadline:
+                return False,last
+            self._logout_wait(min(1.0,max(0.0,deadline-now)))
+
+    def _recover_tec_logout(self,wifi,report,check_allowed):
+        client=None
+        self._logout_recovery_needed=True
+        try:
+            if not protocol._session_mac(wifi.mac):
+                raise RuntimeError('无法核对本机无线设备MAC，未自动提交自助下线。')
+            account,password=self._logout_credentials(report)
+            self.register_secrets(account,password)
+            check_allowed()
+            self.message('正在通过校园网自助服务核对并下线本机，不会处理其他设备…')
+            client=selfservice.Client(wifi,reader=check_allowed,cleanup_reader=core.read_wifi,trace=self.record)
+            client.login(account,password)
+            lookup_deadline=time.monotonic()+LOGOUT_SESSION_LOOKUP_TIMEOUT
+            while True:
+                check_allowed()
+                devices=client.list_online_devices()
+                try:
+                    selfservice.select_current_session(devices,wifi,report)
+                except selfservice.NoMatchingDevice:
+                    if any(d.mac==protocol._session_mac(wifi.mac) for d in devices):
+                        raise selfservice.AmbiguousDevice('自助服务中的本机地址信息无法核对，未下线其他会话。')
+                    if time.monotonic()>=lookup_deadline:
+                        raise selfservice.NoMatchingDevice('后台未出现可核对的本机会话，未发送下线请求；暂不能确认接入已断开。')
+                    self.message('正在等待后台会话可核对，不会重复提交或处理其他设备…')
+                    self._logout_wait(min(2.0,max(0.0,lookup_deadline-time.monotonic())))
+                    continue
+                break
+            client.disconnect_current(report,before_disconnect=check_allowed)
+            if client.safe_summary().get('device_reappeared'):
+                self.logout_diagnostic['outcome']='session_reappeared'
+                self.message('自助下线后，本机又出现在线会话；未重复下线，请核对其他客户端或自动认证设置。')
+                return False
+            self.message('正在持续确认本机已下线，请稍候…')
+            confirmed,last=self._confirm_tec_logout(wifi,client,check_allowed)
+            if confirmed:
+                self.session_cookies=[]
+                self._logout_recovery_needed=False
+                self.logout_diagnostic['outcome']='offline_confirmed'
+                self.message('已下线（自助服务和认证状态已持续确认）')
+                return True
+            self.logout_diagnostic['outcome']='unconfirmed'
+            self.message('已执行注销核对，但仍未确认本机持续离线；未重复提交，请从自助服务检查。')
+            return False
+        except Exception as exc:
+            self.logout_diagnostic['outcome']='recovery_failed'
+            self.logout_diagnostic['error_type']=type(exc).__name__
+            self.record_exception('logout.recovery_error',exc)
+            detail=str(exc) if isinstance(exc,(selfservice.SelfServiceError,RuntimeError)) else '自助服务暂时无法连接。'
+            portal_requests=self.auth_diagnostic.get('authentication_requests',0)
+            service_requests=client.safe_summary().get('disconnect_requests',0) if client is not None else 0
+            prefix=('本次未发送注销请求。' if portal_requests==0 and service_requests==0 else
+                    '门户未提交注销，已尝试自助下线；' if portal_requests==0 else '')
+            self.message(prefix+'注销尚未确认。'+detail+' 可打开底部“自助服务”手动核对。')
+            return False
+        finally:
+            if client is not None:
+                client.close()
+                self.logout_diagnostic['selfservice']=client.safe_summary()
+            service_summary=self.logout_diagnostic.get('selfservice',{})
+            self.auth_diagnostic['selfservice_login_attempted']=service_summary.get('login_attempted',False)
+            self.auth_diagnostic['selfservice_logout_requests']=service_summary.get('disconnect_requests',0)
+            self.auth_diagnostic['logout_requests']=self.logout_diagnostic.get('portal_requests',0)+service_summary.get('disconnect_requests',0)
+            self.auth_diagnostic['phase']=self.logout_diagnostic.get('outcome','unconfirmed')
+            self.record('logout.recovery_completed',diagnostic=self.logout_diagnostic)
 
     def logout(self):
         self.record('logout.requested')
@@ -762,9 +1045,33 @@ class App:
             return {'ok':False,'message':str(exc)}
         def job():
             self.wifi=wifi
+            self.auto_attempted=True
+            self._stu_popup_pending=False
+            self._logout_watch={'ssid':wifi.ssid.casefold(),'guid':wifi.guid,
+                                'started':time.monotonic(),'saw_offline':False}
+            self._logout_recovery_needed=False
+            self.logout_diagnostic={'outcome':'pending','portal_requests':0,'portal_result':None}
             self.message('正在检查登录状态…')
             report=self.session_engine(wifi,tec).status()
             self.apply_session(wifi,report)
+            route_token=self._observe_portal_network(wifi)
+            def check_allowed():
+                current=self.checked_wifi(wifi,tec)
+                self._assert_portal_route(wifi,route_token)
+                return current
+            if tec:
+                # Preserve the live account-service session identifier. A portal
+                # logout can erase its record before the AC is actually offline.
+                if report.get('state')!='online':
+                    self.record('logout.preflight_blocked',backend='portal',state=report.get('state'),
+                                reason=report.get('detail','status_unconfirmed'),authentication_requests=0)
+                self.auth_diagnostic={'operation':'logout','backend':'selfservice',
+                    'phase':'account_service_first','authentication_requests':0}
+                self._recover_tec_logout(wifi,report,check_allowed)
+                # Do not clear the portal/database record after account-service
+                # recovery failed: its live session ID is needed for a real AC
+                # disconnect, and a transient portal offline is insufficient.
+                return
             if report.get('state')=='offline':
                 self.message('当前无线网未登录，无需注销')
                 return
@@ -773,18 +1080,16 @@ class App:
                             reason=report.get('detail','status_unconfirmed'),authentication_requests=0)
                 self.message(self.status_failure_message(report,'未确认当前登录状态，本次未发送注销请求；请先刷新状态后再注销。'))
                 return
-            def check_allowed():
-                self.checked_wifi(wifi,tec)
             self.message('正在退出登录…')
             result=self.run_authentication(wifi,'','',self.settings.get('operator',''),'logout',tec,check_allowed)
+            self.logout_diagnostic.update(portal_result=result,
+                portal_requests=self.auth_diagnostic.get('authentication_requests',0))
             check_allowed()
-            # The original school page also rejects the reported field
-            # session. Preserve that failure and read back status; repeating
-            # another logout transport cannot establish success.
             report=self.session_engine(wifi,tec).status()
             self.apply_session(wifi,report)
             if report.get('state')=='offline':
                 self.session_cookies=[]
+                self.logout_diagnostic['outcome']='offline_confirmed'
                 self.message('已退出登录（服务器状态已确认）')
             elif result is False:
                 self.record('logout.rejected',state=report.get('state'),diagnostic=self.auth_diagnostic)
@@ -814,6 +1119,8 @@ class App:
         with self.lock:
             self.consume_notifications()
             previous=self.wifi
+            route_changed=self._portal_network_context(current)!=self._portal_network_context(previous)
+            self._observe_portal_network(current)
             self.wifi=current
             first_poll=not getattr(self,'_stu_poll_initialized',False)
             self._stu_poll_initialized=True
@@ -854,7 +1161,7 @@ class App:
             # DHCP renewal alone is NOT a new connection/permission to retry.
             if not current.campus or (previous.campus and current.guid!=previous.guid):
                 self.auto_attempted=False
-            if current.key!=previous.key:
+            if current.key!=previous.key or route_changed:
                 self.unconfirmed_connectivity={}
                 self.record('network.changed',previous=core.asdict(previous),current=core.asdict(current))
                 self.portal_key=None
@@ -865,13 +1172,21 @@ class App:
                 self.session_checked_key=None
                 self.session_checked_monotonic=0.0
                 if self.busy: self.cancel.set()
-                if self.auth_key and current.key!=self.auth_key:
+                if self.auth_key and (current.key!=self.auth_key or route_changed):
                     self.logged_in=False
                     self.auth_key=None
                     self.session_cookies=[]
                 if not self.busy:
                     self.status='未登录' if current.ready else '请连接校园 WiFi 后登录'
             enabled=self.stu_automation_enabled()
+            watch=getattr(self,'_logout_watch',None)
+            if watch and current.ssid and current.ssid.casefold()!=watch['ssid']:
+                self._logout_watch=None
+                self._logout_recovery_needed=False
+            if self._logout_auto_suppressed(current):
+                self.auto_attempted=True
+                self._stu_popup_pending=False
+                enabled=False
             if (enabled and current.campus and current.guid not in self.reconnecting
                     and getattr(self,'_stu_popup_pending',False) and self.window is not None):
                 self._stu_popup_pending=False
@@ -934,6 +1249,7 @@ class App:
             if code in (20,21):
                 self.reconnecting.add(guid)
                 if guid==self.wifi.guid:
+                    self._invalidate_logout_route('wlan_disconnect')
                     self._stu_popup_reset_pending=True
                     self._stu_auth_requires_stability=True
                     self._stu_auth_snapshot=None
@@ -951,6 +1267,8 @@ class App:
                     self.session_cookies=[]
                     if self.busy: self.cancel.set()
             elif code==10:
+                if guid==self.wifi.guid:
+                    self._invalidate_logout_route('wlan_connected')
                 self.reconnecting.discard(guid)
 
     def show_window(self):
@@ -1044,6 +1362,7 @@ class App:
         data['authentication']=self.auth_diagnostic
         data['network_check']=getattr(self,'network_diagnostic',{})
         data['unconfirmed_connectivity']=getattr(self,'unconfirmed_connectivity',{})
+        data['logout_recovery']=getattr(self,'logout_diagnostic',{})
         data['session']={'state':self.session_state,'checked_at':self.session_checked_at,
                          'query':self.session_diagnostic}
         data['last_job_elapsed_ms']=self.last_job_elapsed_ms
