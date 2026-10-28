@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import traceback
 
 from PyInstaller.archive.readers import CArchiveReader
 import PyInstaller
@@ -21,12 +22,63 @@ ROOT = Path(__file__).resolve().parent.parent
 if __package__:
     from .verification_context import (begin_verification, finish_verification,
                                        runtime_source_names, validate_test_reports, unit_test_coverage)
+    from .slim_distribution import inspect_archive, verify_inventory
 else:
     from verification_context import (begin_verification, finish_verification,
                                       runtime_source_names, validate_test_reports, unit_test_coverage)
+    from slim_distribution import inspect_archive, verify_inventory
 SOURCES = sorted(runtime_source_names(ROOT))
 BRAND_ASSETS = ('assets/logo.png', 'assets/icon.ico')
 ICON_SIZES = {16, 24, 32, 48, 64, 128, 256}
+
+
+def run_smoke_process(command, directory, env, console_path, timeout=90):
+    """Keep the original PID until its whole PyInstaller process tree is stopped.
+
+    subprocess.run(timeout=...) kills only the onefile parent on Windows. Its
+    child can retain the EXE and modal error dialog, masking the original error
+    with a temporary-directory PermissionError during context cleanup.
+    """
+    console_path = Path(console_path)
+    console_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    process = None
+    with console_path.open('wb') as console:
+        try:
+            process = subprocess.Popen(command, cwd=directory, env=env, stdout=console,
+                                       stderr=subprocess.STDOUT, creationflags=flags)
+            returncode = process.wait(timeout=timeout)
+        except BaseException as exc:
+            cleanup = []
+            if process is not None and process.poll() is None:
+                if os.name == 'nt':
+                    try:
+                        stopped = subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
+                            creationflags=flags)
+                        cleanup.append({'tree_exit_code': stopped.returncode,
+                                        'output': stopped.stdout.decode('utf-8', 'replace')})
+                    except BaseException as stop_error:
+                        cleanup.append({'tree_error': type(stop_error).__name__, 'message': str(stop_error)})
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=10)
+                except BaseException as stop_error:
+                    cleanup.append({'wait_error': type(stop_error).__name__, 'message': str(stop_error)})
+            failure = {'error_type': type(exc).__name__, 'message': str(exc),
+                       'traceback': traceback.format_exc(),
+                       'process_id': process.pid if process is not None else None,
+                       'termination': cleanup}
+            try:
+                console_path.with_suffix('.failure.json').write_text(
+                    json.dumps(failure, ensure_ascii=False, indent=2), encoding='utf-8')
+            except OSError:
+                pass  # Preserve the triggering error even if its log cannot be written.
+            raise
+    if returncode != 0:
+        raise RuntimeError(f'Packaged self-test exited with code {returncode}; see {console_path}')
+    return subprocess.CompletedProcess(command, returncode)
 
 
 def sha(path):
@@ -121,7 +173,8 @@ def main():
     assert all(report.get('version') == core.VERSION for report in reports.values()), 'Test report version mismatch'
     exe = ROOT / '.local/dist' / f'矿大校园网登录器_v{core.VERSION}.exe'
     resources = inspect_windows_resources(exe, core.VERSION, ROOT / 'assets/icon.ico')
-    with tempfile.TemporaryDirectory(prefix='cumt-portable-exe-') as temporary:
+    # A cleanup failure must never replace the actual process/verification error.
+    with tempfile.TemporaryDirectory(prefix='cumt-portable-exe-', ignore_cleanup_errors=True) as temporary:
         independent = Path(temporary)
         copied = independent / '校园网登录器.exe'
         shutil.copy2(exe, copied)
@@ -129,8 +182,13 @@ def main():
         env = dict(os.environ)
         env.pop('PYTHONPATH', None)
         env['LOCALAPPDATA'] = str(independent / 'LocalData')
-        smoke = subprocess.run([str(copied), '--smoke-test'], cwd=independent, env=env, timeout=90)
-        result = json.loads((independent / 'packaged_smoke_results.json').read_text('utf-8'))
+        smoke = run_smoke_process([str(copied), '--smoke-test'], independent, env,
+                                  work / 'portable-smoke-console.log')
+        report_path = independent / 'packaged_smoke_results.json'
+        if not report_path.is_file():
+            raise RuntimeError('Packaged self-test exited without a result; see '
+                               + str(work / 'portable-smoke-console.log'))
+        result = json.loads(report_path.read_text('utf-8'))
         assert smoke.returncode == 0 and result['success'] and result['runtime_log_ready'] and result['diagnostic_zip_verified'] and result['window_restore_verified'] and result['online_identity_display'], result
         assert result['ui_logo_loaded'] and result['native_icon']['verified'], 'Runtime branding validation failed'
         assert result['network_check_entry'], 'Network check bridge and UI entry are missing'
@@ -155,6 +213,8 @@ def main():
                ('credentials.dpapi', 'settings.json', 'diagnostic-', 'test-logs', 'test_logging', 'test_runtime_logging'))]
     assert not private, private
     assert not any(name.startswith('test_') for name in pyz.toc), 'Test modules bundled'
+    inventory = inspect_archive(exe)
+    distribution_verification = verify_inventory(inventory, result.get('webview2_compatibility'))
     assert before == {name: sha(ROOT / name) for name in SOURCES}, 'Sources changed during packaged validation'
     verification = finish_verification(verification, ROOT)
     assert verification['source_stable'], 'Product or verification sources changed during build'
@@ -175,6 +235,8 @@ def main():
                 'brand_assets_bundled': True, 'bundled_brand_assets_sha256': bundled_assets,
                 'embedded_icon_verified': True, 'windows_versions_verified': True,
                 'windows_resources': resources}
+    manifest.update(package_inventory=inventory,
+                    distribution_verification=distribution_verification)
     (ROOT / 'research' / ('build_manifest_v' + core.VERSION.replace('.', '_') + '.json')).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', 'utf-8')
     print(json.dumps({'version': core.VERSION, 'sha256': manifest['sha256'],

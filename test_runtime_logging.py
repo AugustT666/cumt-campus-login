@@ -29,6 +29,8 @@ PASSWORD = 'offline-秘密 P&<pass>\\"-987654!'
 
 class RuntimeLoggingIntegrationTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
+        self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -214,7 +216,8 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
                 engine = MagicMock()
                 engine.status.side_effect = ([{'state':'offline','matched_ip':True},
                                              {'state':'online','matched_ip':True}]
-                                            if outcome else [{'state':'offline','matched_ip':True}])
+                                            if outcome else [{'state':'offline','matched_ip':True},
+                                                             {'state':'offline','matched_ip':True}])
                 def fake_authenticate(*args, **kwargs):
                     core.trace('protocol.authentication_result', result=trace)
                     return outcome, trace
@@ -392,9 +395,40 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
         self.assertTrue(any(row['event'] == 'fixture.main_reached' for row in rows))
         self.assertEqual(rows[-1]['event'], 'session_closed')
 
+    def test_packaged_smoke_startup_failure_writes_report_and_exits_without_dialog(self):
+        output = self.root / 'isolated-smoke-output'
+        output.mkdir()
+        executable = output / 'fictional-client.exe'
+        secret = 'fictional-smoke-startup-private-value'
+
+        def failed_startup(log):
+            log.register_secrets(secret)
+            raise RuntimeError(secret)
+
+        previous_root = core.data_root
+        with patch.object(sys, 'argv', ['campus_app.py', '--smoke-test']), \
+                patch.object(sys, 'executable', str(executable)), \
+                patch.object(app.platform, 'platform', return_value='offline-platform'), \
+                patch.object(app, 'run_main', side_effect=failed_startup):
+            with self.assertRaises(SystemExit) as exited:
+                app.main()
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIs(core.data_root, previous_root)
+        report = json.loads((output / 'packaged_smoke_results.json').read_text('utf-8'))
+        self.assertFalse(report['success'])
+        self.assertEqual(report['version'], core.VERSION)
+        self.assertEqual(report['error_type'], 'RuntimeError')
+        preserved = (output / 'packaged_smoke_failure.jsonl').read_text('utf-8')
+        self.assertIn('failed_startup', preserved)
+        self.assertIn('Traceback', preserved)
+        self.assertNotIn(secret, preserved)
+        self.assertNotIn(secret, json.dumps(report))
+
     def test_main_unwritable_data_root_uses_recovery_and_restores_original_root(self):
         captured = []
-        recovery = self.root / 'fixture-temp-base' / 'CumtCampusLogin-Recovery'
+        recovery_name = ('CumtCampusLoginExperimental-Recovery' if app.EXPERIMENTAL
+                         else 'CumtCampusLogin-Recovery')
+        recovery = self.root / 'fixture-temp-base' / recovery_name
         def fake_run_main(log):
             captured.append(log)
             self.assertEqual(core.data_root(), recovery)

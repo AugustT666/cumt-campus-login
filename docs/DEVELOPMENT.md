@@ -2,7 +2,7 @@
 
 ## 版本与环境
 
-本快照对应 v1.6.4。版本用途及分支约定见 [版本说明](1.6.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
+本快照对应 v1.7.4。版本用途及分支约定见 [版本说明](1.7.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
 
 需要 Windows、Python 3.12 和 WebView2 Runtime。v1.6.4 的门户兼容还需要系统已有 Edge 或 Chrome；v1.7.4 生产包使用独立 WebView2 控件。
 
@@ -19,7 +19,7 @@ py -3.12 -m venv .venv
 先安装开发或构建依赖，再运行公开仓库自带的合成测试：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-build-lock.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe research/run_offline_tests.py
 .\.venv\Scripts\python.exe research/ui_smoke.py
 .\.venv\Scripts\python.exe research/ui_smoke.py --hidden

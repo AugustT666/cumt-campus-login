@@ -17,9 +17,11 @@ import zipfile
 if __package__:
     from .verification_context import (RUNTIME_SOURCES, capture_source, runtime_source_names,
                                        validate_test_reports, validate_verification, unit_test_coverage)
+    from .slim_distribution import inspect_archive, verify_inventory
 else:
     from verification_context import (RUNTIME_SOURCES, capture_source, runtime_source_names,
                                       validate_test_reports, validate_verification, unit_test_coverage)
+    from slim_distribution import inspect_archive, verify_inventory
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -106,6 +108,12 @@ def validate(version: str) -> tuple[dict, dict, Path]:
     exe = project_file(f".local/dist/矿大校园网登录器_v{version}.exe")
     require(exe.stat().st_size == manifest.get("size_bytes"), "EXE size mismatch")
     require(sha(exe) == manifest.get("sha256"), "EXE hash mismatch")
+    inventory = inspect_archive(exe)
+    require(inventory == manifest.get('package_inventory'),
+            'The packaged archive inventory changed or was not recorded')
+    distribution = verify_inventory(inventory, smoke.get('webview2_compatibility'))
+    require(distribution == manifest.get('distribution_verification'),
+            'The slim distribution evidence is missing or mismatched')
     return manifest, reports, exe
 
 
@@ -190,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                 "1.5.1_guanshanfu": "User confirmed the client recovered after logging out through the school self-service portal",
             },
             "credentials_in_delivery": False,
+            "distribution_verification": manifest['distribution_verification'],
         }
         checksum = ROOT / "程序校验.json"
         temporary_check = checksum.with_suffix(".json.tmp")

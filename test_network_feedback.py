@@ -80,6 +80,8 @@ class ProtocolNetworkFeedbackTests(unittest.TestCase):
 
 class AppNetworkFeedbackTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
+        self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.store = core.Store(self.root)

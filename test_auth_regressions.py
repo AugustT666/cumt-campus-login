@@ -1,7 +1,7 @@
 """Offline regressions for the real Dr.COM compression and readiness failures.
 
 All portal HTTP traffic is handled in memory through a fake BoundHTTP.  The
-browser tests execute actual Edge/Chrome JavaScript but never read credentials,
+browser tests execute actual WebView2 JavaScript but never read credentials,
 create a Store, change WiFi, or contact the campus server.
 """
 import base64

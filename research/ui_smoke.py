@@ -44,7 +44,7 @@ def main():
         assert page.locator('#login-switch').count()==0
         assert page.locator('#tec').count()==0
         assert page.locator('#profiles').count()==1
-        assert page.locator('#startup').get_attribute('aria-label')=='连接 STU 时自动弹出'
+        assert page.locator('#startup').get_attribute('aria-label')=='连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出'
         assert page.locator('.row .note').inner_text()=='后台监听，连接后弹出；有已保存账号时自动尝试一次'
         assert page.locator('#online-account').inner_text()=='在线账号：尚未确认'
         assert page.locator('#account-switch-note').is_hidden()

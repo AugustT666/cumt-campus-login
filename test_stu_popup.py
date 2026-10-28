@@ -18,6 +18,8 @@ STU=core.Wifi(core.STU,HOTSPOT.guid,HOTSPOT.index,'10.52.140.8',
 
 class StuPopupTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
+        self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.client=app.App.__new__(app.App)
         self.client.lock=threading.RLock()
         self.client.closed=threading.Event()

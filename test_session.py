@@ -13,6 +13,8 @@ WIFI=core.Wifi('CUMT_Stu','session-fixture',5,'10.52.1.2','00-11-22-33-44-55')
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
+        self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.temp=tempfile.TemporaryDirectory()
         self.store=core.Store(Path(self.temp.name))
         with patch.object(core,'Store',return_value=self.store):

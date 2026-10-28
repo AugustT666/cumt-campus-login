@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_SOURCES = {'campus_core.py', 'campus_ui.html', '矿大校园网助手.spec', 'requirements.txt', 'campus_network.py', 'assets/icon.ico', 'assets/logo.png', 'assets/logo-master.png', 'campus_logging.py', 'campus_protocol.py', 'campus_app.py', 'requirements-build-lock.txt'}
-MAINTENANCE_INPUTS = {'research/run_offline_tests.py', 'research/ui_smoke.py', 'research/verification_context.py', 'research/package_current.py', 'research/build_and_verify.py', 'research/install_desktop_shortcut.ps1', 'research/generate_icons.py'}
+RUNTIME_SOURCES = {'campus_core.py', 'campus_webview2.py', 'campus_ui.html', '矿大校园网助手.spec', 'requirements.txt', 'build_support/hooks/hook-webview.py', 'campus_network.py', 'assets/icon.ico', 'assets/logo.png', 'assets/logo-master.png', 'campus_logging.py', 'campus_protocol.py', 'campus_app.py', 'campus_browser.py', 'requirements-build-lock.txt'}
+MAINTENANCE_INPUTS = {'research/run_offline_tests.py', 'research/ui_smoke.py', 'research/verification_context.py', 'research/package_current.py', 'research/build_and_verify.py', 'research/slim_distribution.py', 'research/install_desktop_shortcut.ps1', 'research/generate_icons.py'}
 OPTIONAL_INPUTS = {'requirements-dev.txt'}
 REPORT_COMMANDS = {
     'unit': ['<python>', 'research/run_offline_tests.py'],

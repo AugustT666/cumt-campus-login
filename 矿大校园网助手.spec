@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import ast
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.win32.versioninfo import (VSVersionInfo,FixedFileInfo,StringFileInfo,
                                                 StringTable,StringStruct,VarFileInfo,VarStruct)
 
@@ -31,11 +30,8 @@ version_info=VSVersionInfo(
 datas = [(str(ROOT / 'campus_ui.html'), '.')]
 datas += [(str(ROOT/'assets'/name),'assets') for name in ('logo.png','icon.ico')]
 binaries = []
-hiddenimports = ['clr', 'pythonnet']
-tmp_ret = collect_all('webview')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('playwright')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = ['clr', 'pythonnet', 'webview.platforms.winforms',
+                 'webview.platforms.edgechromium']
 
 
 a = Analysis(
@@ -44,10 +40,15 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=[str(ROOT / 'build_support' / 'hooks')],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['playwright', 'greenlet', 'pyee', 'webview.__pyinstaller',
+              'webview.platforms.android', 'webview.platforms.cef',
+              'webview.platforms.cocoa', 'webview.platforms.gtk',
+              'webview.platforms.qt', 'webview.platforms.mshtml',
+              'PyInstaller', '_pyinstaller_hooks_contrib', 'setuptools',
+              'pkg_resources', 'pefile', 'altgraph', 'packaging'],
     noarchive=False,
     optimize=0,
 )

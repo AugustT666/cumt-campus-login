@@ -23,7 +23,47 @@ from campus_logging import RuntimeLog
 
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
 TITLE = '矿大校园网登录器'
-APP_USER_MODEL_ID = 'AugustT666.CumtCampusLogin'
+EXPERIMENTAL = bool(getattr(core,'EXPERIMENTAL_BUILD',False) or '--experimental' in sys.argv)
+APP_USER_MODEL_ID = 'AugustT666.CumtCampusLogin' + ('.Experimental' if EXPERIMENTAL else '')
+STARTUP_VALUE_NAME = 'CumtCampusLoginExperimental' if EXPERIMENTAL else 'CumtCampusLogin'
+STABLE_STARTUP_VALUE_NAME = 'CumtCampusLogin'
+STABLE_INSTANCE_MUTEX = r'Local\CumtCampusLoginDesktopV1'
+
+
+def stable_autostart_configured():
+    """Read the stable Run value without changing either client's settings."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
+            value, kind = winreg.QueryValueEx(key, STABLE_STARTUP_VALUE_NAME)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError('暂时无法检查稳定版自动启动配置，试用版自动登录已停止；请稍后重试或手动登录。') from exc
+    return kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) and isinstance(value, str) and bool(value.strip())
+
+
+def stable_instance_running():
+    """Check the stable instance's existing named mutex; never create one."""
+    try:
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenMutexW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
+        kernel.OpenMutexW.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        handle = kernel.OpenMutexW(0x00100000, False, STABLE_INSTANCE_MUTEX)
+        if handle:
+            kernel.CloseHandle(handle)
+            return True
+        error = ctypes.get_last_error()
+        if error == 2:  # ERROR_FILE_NOT_FOUND: no stable instance object exists.
+            return False
+        if error == 5:  # Access denied still proves the named object exists.
+            return True
+        raise OSError(error, 'Cannot inspect the stable instance mutex')
+    except OSError as exc:
+        raise RuntimeError('暂时无法检查稳定版运行状态，试用版自动登录已停止；请稍后重试或手动登录。') from exc
 
 class Bridge:
     def __init__(self, app): self._app = app
@@ -373,10 +413,18 @@ class App:
     def startup_enabled(self):
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
-                value,_=winreg.QueryValueEx(key,'CumtCampusLogin')
+                value,_=winreg.QueryValueEx(key,STARTUP_VALUE_NAME)
                 return str(sys.executable if getattr(sys,'frozen',False) else Path(__file__).resolve()).casefold() in value.casefold()
         except OSError:
             return False
+
+    def _ensure_exclusive_auto(self):
+        if not EXPERIMENTAL:
+            return
+        if stable_autostart_configured():
+            raise RuntimeError('检测到稳定版启动项配置，试用版自动登录已停止；请先在稳定版关闭自动启动或清理旧启动配置，也可使用手动登录。')
+        if stable_instance_running():
+            raise RuntimeError('稳定版正在运行，试用版自动登录已停止；请退出稳定版后重试，或使用手动登录。')
 
     def set_startup(self,enabled):
         with self.lock:
@@ -386,6 +434,14 @@ class App:
         if type(enabled) is not bool:
             return {'ok':False,'message':'自动启动设置无效，请重新选择。'}
         self.record('startup.setting_requested',enabled=enabled)
+        if enabled and EXPERIMENTAL:
+            try:
+                if stable_autostart_configured():
+                    self.record('startup.coexistence_blocked',level='WARNING',reason='stable_autostart')
+                    return {'ok':False,'message':'检测到稳定版启动项配置。请先在稳定版关闭“连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出”或清理旧启动配置，再启用试用版；退出旧窗口不会取消其开机启动。'}
+            except RuntimeError as exc:
+                self.record_exception('startup.coexistence_check_error',exc)
+                return {'ok':False,'message':str(exc)}
         try:
             current=core.read_wifi() if enabled else self.wifi
             updated=dict(self.settings,stu_autostart=enabled)
@@ -396,13 +452,14 @@ class App:
                         command='"'+sys.executable+'" --startup'
                     else:
                         command='"'+sys.executable+'" "'+str(Path(__file__).resolve())+'" --startup'
-                    winreg.SetValueEx(key,'CumtCampusLogin',0,winreg.REG_SZ,command)
+                    if EXPERIMENTAL:command+=' --experimental'
+                    winreg.SetValueEx(key,STARTUP_VALUE_NAME,0,winreg.REG_SZ,command)
                 else:
-                    try: winreg.DeleteValue(key,'CumtCampusLogin')
+                    try: winreg.DeleteValue(key,STARTUP_VALUE_NAME)
                     except FileNotFoundError: pass
             self.settings=updated
             # Enabling while already connected does not submit unexpectedly.
-            if enabled and current.student:
+            if enabled and current.campus:
                 self.auto_attempted=True
                 self._stu_popup_connection=(current.ssid.casefold(),current.guid,current.index)
                 self._stu_popup_pending=False
@@ -526,9 +583,16 @@ class App:
             return {'ok':False,'message':'请输入账号和密码。'}
         try:
             wifi,tec=self.permitted(logout=True)
-            if automatic and (not wifi.student or not self.stu_automation_enabled()):
+            if automatic and (not wifi.campus or not self.stu_automation_enabled()):
                 return {'ok':False,'message':'自动登录已停止。'}
-            if expected: core.guard(expected,wifi)
+            if automatic:
+                try:
+                    self._ensure_exclusive_auto()
+                except RuntimeError:
+                    self.auth_diagnostic={'operation':'login','backend':'status_only',
+                                          'phase':'coexistence_blocked','authentication_requests':0}
+                    raise
+            if expected: core.guard(expected,wifi,tec)
         except RuntimeError as exc:
             self.record_exception('login.rejected',exc)
             return {'ok':False,'message':str(exc)}
@@ -540,10 +604,12 @@ class App:
             if not automatic:
                 saved=self.save_profile(profile_id,account,password,operator)
                 if not saved['ok']: return saved
-            if wifi.student: self.auto_attempted=True
+            if wifi.campus: self.auto_attempted=True
         def check_allowed():
             if self.cancel.is_set() or self.closed.is_set() or (automatic and not self.stu_automation_enabled()):
                 raise RuntimeError('本次登录已停止。')
+            if automatic:
+                self._ensure_exclusive_auto()
             core.guard(wifi,core.read_wifi(),tec)
         def job():
             check_allowed()
@@ -601,10 +667,29 @@ class App:
                             '服务器已接受登录，在线状态尚未确认；请稍后刷新状态，未再次提交。')
                     self.message(self.status_failure_message(report,detail))
             elif result is False:
-                self.logged_in=False;self.auth_key=None;self.session_state='offline'
-                self.online_account='';self.identity_source=''
-                detail=self.status if self.status.startswith('认证提示：') else (
-                    '登录失败，请检查账号和密码。' if tec else '登录失败，请检查账号、密码及运营商绑定。')
+                # A rejected request does not prove that this device is offline:
+                # the server can reject a second login while it is already online.
+                # Keep the original authentication result and read the session once.
+                rejection=self.status if self.status.startswith('认证提示：') else ''
+                report={'state':'unknown','detail':'post_rejection_status_unconfirmed'}
+                try:
+                    report=self.session_engine(wifi,tec).status()
+                except Exception as exc:
+                    self.record_exception('session.rejection_check_error',exc)
+                    if isinstance(exc,(OSError,http.client.HTTPException)):
+                        report['network_error']=core.network_error_details(exc)
+                self.apply_session(wifi,report)
+                self.record('login.rejected_status_check',state=self.session_state,
+                            request_accepted=False,authentication_requests=
+                            self.auth_diagnostic.get('authentication_requests',0))
+                if self.session_state=='online':
+                    detail='服务器未接受本次登录请求，但复查确认当前无线设备已在线；未再次提交。'
+                elif self.session_state=='offline':
+                    detail='服务器未接受本次登录请求，复查仍未登录；请核对账号和所选登录网络，未再次提交。'
+                else:
+                    detail='服务器未接受本次登录请求，当前在线状态尚未确认；请先刷新状态，未再次提交。'
+                if rejection:detail=rejection+' '+detail
+                detail=self.status_failure_message(report,detail)
                 self.message(self.login_failure_message(detail,wifi))
             else:
                 self.logged_in=False;self.auth_key=None;self.session_state='unknown'
@@ -616,6 +701,8 @@ class App:
     def checked_wifi(self,wifi,tec):
         with self.lock: self.consume_notifications()
         if self.closed.is_set() or self.cancel.is_set(): raise RuntimeError('本次操作已停止。')
+        if getattr(self,'auto_job',False):
+            self._ensure_exclusive_auto()
         current=core.read_wifi()
         core.guard(wifi,current,tec)
         return current
@@ -665,220 +752,14 @@ class App:
         return self.start_job('logout',job)
 
     def authenticate(self,wifi,account,password,operator,operation,tec):
-        """Execute the original portal DOM/script. No guessed login/logout API."""
-        from playwright.sync_api import sync_playwright
-        host=urlsplit(self.portal).hostname
-        count=[0]
-        submission_started=[False]
-        sensitive_phase=[False]
-        preparation_blocked=[False]
-        results=[]
-        trace={'operation':operation,'phase':'loading','authentication_requests':0,
-               'resource_errors':[],'page_errors':[],'blocked_requests':0}
-        self.auth_diagnostic=trace
-        def sanitized(value,limit=200):
-            text=protocol.Engine._redact(value,account,password)
-            log=getattr(self,'runtime_log',None)
-            if log is not None:text=log.sanitize(text)
-            return text[:limit] if limit is not None else text
-        def intercept(route):
-            request=route.request
-            p=urlsplit(request.url)
-            if p.hostname!=host or p.scheme not in ('http','https') or p.port not in (None,80,443,801,802):
-                self.record('browser.request_blocked',level='WARNING',url=request.url,reason='unapproved_origin')
-                route.abort();return
-            connection=None
-            try:
-                if self.closed.is_set() or self.cancel.is_set():
-                    route.abort();return
-                core.guard(wifi,core.read_wifi(),tec)
-                query=dict(core.parse_qsl(p.query))
-                request_headers=request.all_headers()
-                form_values={}
-                if request.method=='POST':
-                    content_type=next((v for k,v in request_headers.items() if k.lower()=='content-type'),'')
-                    if 'application/json' in content_type.lower():
-                        parsed=protocol.parse_jsonp(request.post_data or '')
-                        if parsed is None:
-                            raise ValueError('认证请求JSON格式无效。')
-                        form_values=parsed
-                    else:
-                        form_values=dict(core.parse_qsl(request.post_data or ''))
-                action=str(query.get('a',form_values.get('a',''))).casefold() or p.path.rstrip('/').split('/')[-1].casefold()
-                credential_keys={'ddddd','dddddd','user_account','user_password','username','account','password','upass'}
-                has_credentials=any(k.casefold() in credential_keys for k in (*query,*form_values))
-                # Any write method is a submission candidate, including JSON and
-                # opaque bodies. Once secrets are filled, no resource request is
-                # allowed to smuggle them through an unrecognized GET endpoint.
-                auth_request=(request.method not in ('GET','HEAD')
-                              or action in ('login','logout') or has_credentials)
-                denied=(auth_request and (not submission_started[0] or action!=operation)
-                        or sensitive_phase[0] and not auth_request)
-                if denied or auth_request and count[0]>=1:
-                    trace['blocked_requests']+=1
-                    if sensitive_phase[0] and not submission_started[0]:
-                        preparation_blocked[0]=True
-                    self.record('browser.request_blocked',level='WARNING',url=request.url,
-                                reason='duplicate_submission' if auth_request and count[0]>=1 else 'submission_phase')
-                    route.abort();return
-                resource_started=time.perf_counter()
-                self.record('browser.http_request',method=request.method,url=request.url,
-                            resource_type=request.resource_type,authentication_request=auth_request)
-                connection=core.BoundHTTP(p.hostname,p.port or (443 if p.scheme=='https' else 80),wifi,p.scheme=='https')
-                headers={k:v for k,v in request_headers.items() if k.lower() not in ('host','connection','accept-encoding','content-length')}
-                headers['Connection']='close'
-                target=urlunsplit(('','',p.path or '/',p.query,''))
-                if auth_request:
-                    with self.lock:
-                        self.checked_wifi(wifi,tec)
-                        if self.auto_job and not self.stu_automation_enabled():
-                            route.abort();return
-                        count[0]+=1
-                        trace['authentication_requests']=count[0]
-                        connection.request(request.method,target,request.post_data_buffer,headers)
-                else:
-                    self.checked_wifi(wifi,tec)
-                    connection.request(request.method,target,request.post_data_buffer,headers)
-                response=connection.getresponse()
-                wire_body=response.read(core.MAX_HTTP_WIRE_BYTES+1)
-                if len(wire_body)>core.MAX_HTTP_WIRE_BYTES:
-                    raise ValueError('认证页面资源过大。')
-                body,response_headers=core.decode_http_body(wire_body,response.getheaders())
-                self.record('browser.http_response',url=request.url,status=response.status,
-                            decoded_bytes=len(body),body_sha256=hashlib.sha256(body).hexdigest(),
-                            content_type=response_headers.get('Content-Type',''),
-                            location=response_headers.get('Location',''),
-                            elapsed_ms=round((time.perf_counter()-resource_started)*1000))
-                text=core.decode_text(body,response_headers)
-                evidence_url=request.url
-                if 'a' in form_values and 'a' not in query:
-                    evidence_url=urlunsplit((p.scheme,p.netloc,p.path,core.urlencode({'a':form_values['a']}),''))
-                evidence=authentication_result(text,evidence_url,operation) if auth_request else None
-                if evidence is not None:
-                    results.append(evidence)
-                    trace['phase']='response_received'
-                    trace['result']=evidence
-                    data=protocol.parse_jsonp(text)
-                    trace['response']={k:sanitized(
-                        protocol.decode_portal_message(data[k],data.get('ret_code')) if k=='msg' else data[k],limit=None)
-                        for k in ('result','ret_code','msg','message') if k in data}
-                    if evidence is False:
-                        detail=trace['response'].get('msg') or trace['response'].get('message')
-                        if detail: self.message('认证提示：'+detail)
-                route.fulfill(status=response.status,headers=response_headers,body=body)
-            except Exception as exc:
-                if sensitive_phase[0] and not submission_started[0]:
-                    preparation_blocked[0]=True
-                self.record_exception('browser.resource_error',exc,url=request.url)
-                trace['resource_errors'].append({'path':p.path,'error':type(exc).__name__})
-                trace['resource_errors']=trace['resource_errors'][-12:]
-                route.abort()
-            finally:
-                if connection: connection.close()
-
-        with sync_playwright() as p:
-            browser=None
-            for channel in ('msedge','chrome'):
-                try:
-                    browser=p.chromium.launch(channel=channel,headless=True,args=['--no-proxy-server','--disable-background-networking','--disable-quic','--force-webrtc-ip-handling-policy=disable_non_proxied_udp'])
-                    break
-                except Exception as exc:
-                    self.record_exception('browser.launch_error',exc,channel=channel)
-            if not browser:
-                raise RuntimeError('未找到可用的 Edge 或 Chrome 浏览器。')
-            context=browser.new_context(service_workers='block',accept_downloads=False)
-            context.route('**/*',intercept)
-            if hasattr(context,'route_web_socket'):
-                context.route_web_socket('**/*',lambda ws:ws.close())
-            if operation=='logout' and self.session_cookies:
-                context.add_cookies(self.session_cookies)
-            page=context.new_page()
-            page.set_default_timeout(12000)
-            def page_error(exc):
-                trace['page_errors'].append(sanitized(exc))
-                self.record('browser.page_error',level='ERROR',error=sanitized(exc,limit=None))
-            page.on('pageerror',page_error)
-            page.on('requestfailed',lambda request:self.record('browser.request_failed',level='WARNING',
-                    url=request.url,failure=request.failure))
-            def dialog(d):
-                if (operation=='logout' and submission_started[0] and d.type=='confirm'
-                    and re.search(r'注销|退出|logout',d.message,re.I)):
-                    trace['confirmation']='native'
-                    d.accept()
-                    return
-                text=sanitized(d.message)
-                self.message('认证提示：'+text[:160])
-                d.dismiss()
-            page.on('dialog',dialog)
-            try:
-                page.goto(core.fresh_url(self.portal,wifi),wait_until='domcontentloaded',timeout=35000)
-                # The real Dr.COM document is initially empty; a41.js loads the
-                # form, localization and event handlers asynchronously.
-                from playwright.sync_api import TimeoutError as PlaywrightTimeout
-                try:
-                    page.wait_for_function(r'''operation => {
-                      const visible=e=>e&&e.getClientRects().length&&!e.disabled;
-                      if (operation==='login') {
-                        const user=Array.from(document.querySelectorAll('input[name="DDDDD"],input[name="user_account"],input[name="username"],input[name="account"],input#username,input#user_account')).some(visible);
-                        const pass=Array.from(document.querySelectorAll('input[type="password"]')).some(visible);
-                        if (!user||!pass) return false;
-                      } else {
-                        const buttons=Array.from(document.querySelectorAll('button,input[type="submit"],input[type="button"],a')).filter(visible);
-                        if (!buttons.some(e=>/^(注销|注销登录|退出|退出登录|断开|下线|logout)$/i.test((e.innerText||e.value||'').replace(/\s+/g,'')))) return false;
-                      }
-                      return typeof window.page==='undefined'||!window.page.load_js_css||typeof window.login==='object';
-                    }''',arg=operation,timeout=25000)
-                    # Process pending dynamic scripts before interacting with the form.
-                    page.wait_for_load_state('networkidle',timeout=15000)
-                except PlaywrightTimeout:
-                    trace['phase']='page_not_ready'
-                    raise RuntimeError('认证页面加载不完整，未提交账号；请查看诊断后重试。')
-                core.guard(wifi,core.read_wifi(),tec)
-                if urlsplit(page.url).hostname!=host:
-                    raise RuntimeError('认证页面跳转异常，已停止操作。')
-                if operation=='login':
-                    sensitive_phase[0]=True
-                    fields=page.evaluate(core.FILL_JS,{'account':account,'password':password,'operator':operator})
-                    self.record('browser.form_inspection',result=fields)
-                    if not fields.get('ok') or not fields.get('can_submit'):
-                        trace['phase']='form_not_supported'
-                        raise RuntimeError(fields.get('reason') or '当前认证页面暂不支持自动登录，请通过浏览器完成认证。')
-                    # Drain requests scheduled by input/change handlers before
-                    # granting the one explicit button click its send permission.
-                    page.wait_for_timeout(100)
-                    if preparation_blocked[0]:
-                        trace['phase']='form_network_blocked'
-                        raise RuntimeError('认证页面在填表期间尝试发送请求，已阻止；未正式提交，请通过浏览器手动登录。')
-                    self.checked_wifi(wifi,tec)
-                    submission_started[0]=True
-                    trace['phase']='submitting'
-                    page.locator('[data-cumt-login-button="1"]').click(no_wait_after=True)
-                else:
-                    if not page.evaluate(LOGOUT_JS):
-                        raise RuntimeError('未找到注销入口，请通过校园认证页退出登录。')
-                    self.checked_wifi(wifi,tec)
-                    sensitive_phase[0]=True
-                    submission_started[0]=True
-                    trace['phase']='submitting'
-                    page.locator('[data-cumt-logout-button="1"]').click(no_wait_after=True)
-                confirmed=False
-                for _ in range(14):
-                    if results or self.cancel.is_set() or self.closed.is_set(): break
-                    if operation=='logout' and not confirmed and page.evaluate(LOGOUT_CONFIRM_JS):
-                        self.checked_wifi(wifi,tec)
-                        page.locator('[data-cumt-logout-confirm="1"]').click(no_wait_after=True)
-                        confirmed=True
-                        trace['confirmation']='portal_dialog'
-                    page.wait_for_timeout(500)
-                if operation=='login': self.session_cookies=context.cookies()
-                if results: return results[-1]
-                # Instructional page text is not proof of authentication.
-                return None
-            finally:
-                context.close();browser.close()
+        """Execute the original portal with the private, bound WebView2 host."""
+        from campus_browser import authenticate
+        return authenticate(self,wifi,account,password,operator,operation,tec,
+                            result_parser=authentication_result,
+                            logout_select_js=LOGOUT_JS,logout_confirm_js=LOGOUT_CONFIRM_JS)
 
     def poll_wifi(self):
-        """Show each STU connection independently of its optional authentication."""
+        """Show each campus connection independently of its optional authentication."""
         current=core.read_wifi()
         attempt=False
         popup=False
@@ -888,33 +769,42 @@ class App:
             self.wifi=current
             first_poll=not getattr(self,'_stu_poll_initialized',False)
             self._stu_poll_initialized=True
-            if not previous.student and previous.ip:
+            if not previous.campus and previous.ip:
                 self._stu_previous_network=(previous.ip,previous.gateway,previous.index)
-            if not current.student and current.ip:
+            if not current.campus and current.ip:
                 self._stu_previous_network=(current.ip,current.gateway,current.index)
-            connection=(current.ssid.casefold(),current.guid,current.index) if current.student else None
+            connection=(current.ssid.casefold(),current.guid,current.index) if current.campus else None
             reset=getattr(self,'_stu_popup_reset_pending',False)
-            if not current.student:
+            if not current.campus:
                 self._stu_popup_connection=None
                 self._stu_popup_pending=False
                 self._stu_auth_snapshot=None
                 self._stu_auth_stable_count=0
                 self._stu_network_pending=False
             elif reset or connection!=getattr(self,'_stu_popup_connection',None):
+                # Switching STU/TEC on one adapter is a new connection, but
+                # wait for two consistent address snapshots before submitting.
+                previous_connection=(previous.ssid.casefold(),previous.guid,previous.index)
+                tracked_connection=getattr(self,'_stu_popup_connection',None)
+                if (reset or connection!=previous_connection
+                        or tracked_connection is not None and connection!=tracked_connection):
+                    self.auto_attempted=False
+                if previous.campus and connection!=previous_connection:
+                    self._stu_auth_requires_stability=True
                 self._stu_popup_connection=connection
                 self._stu_popup_reset_pending=False
                 # A manual launch already has a visible window. A hidden
                 # Windows-startup launch must still show when STU is present.
                 manual_initial=(first_poll and not getattr(self,'startup',False)
                                 and self.window is not None and not reset
-                                and (not previous.ssid or previous.student))
+                                and (not previous.ssid or previous.campus))
                 self._stu_popup_pending=not manual_initial
                 self._stu_auth_snapshot=None
                 self._stu_auth_stable_count=0
                 self.record('network.stu_connection',popup_pending=self._stu_popup_pending,
                             manual_initial=manual_initial,interface_index=current.index)
             # DHCP renewal alone is NOT a new connection/permission to retry.
-            if not current.student or (previous.student and current.guid!=previous.guid):
+            if not current.campus or (previous.campus and current.guid!=previous.guid):
                 self.auto_attempted=False
             if current.key!=previous.key:
                 self.record('network.changed',previous=core.asdict(previous),current=core.asdict(current))
@@ -933,7 +823,7 @@ class App:
                 if not self.busy:
                     self.status='未登录' if current.ready else '请连接校园 WiFi 后登录'
             enabled=self.stu_automation_enabled()
-            if (enabled and current.student and current.guid not in self.reconnecting
+            if (enabled and current.campus and current.guid not in self.reconnecting
                     and getattr(self,'_stu_popup_pending',False) and self.window is not None):
                 self._stu_popup_pending=False
                 popup=True
@@ -943,7 +833,7 @@ class App:
             stale=getattr(self,'_stu_previous_network',None)
             carried=bool(stale and (current.ip==stale[0]
                          or (stale[1] and current.gateway==stale[1])))
-            network_ready=(current.student and current.ready and core.campus_host(current.ip)
+            network_ready=(current.campus and current.ready and core.campus_host(current.ip)
                            and current.guid not in self.reconnecting and not carried)
             snapshot=(current.ip,current.gateway,current.index)
             if network_ready:
@@ -957,9 +847,9 @@ class App:
             else:
                 self._stu_auth_snapshot=None
                 self._stu_auth_stable_count=0
-                if carried and current.student:
+                if carried and current.campus:
                     self._stu_auth_requires_stability=True
-            waiting=bool(current.student and not network_ready)
+            waiting=bool(current.campus and not network_ready)
             if waiting!=getattr(self,'_stu_network_pending',False):
                 self.record('network.stu_address_waiting' if waiting else 'network.stu_address_ready',
                             source_ip=current.ip,gateway=current.gateway,carried_previous_lease=carried)
@@ -975,12 +865,12 @@ class App:
                     selected=self.store.selected_profile()
                     if not selected.get('account') or not selected.get('password'):
                         self.record('network.auto_login_skipped',reason='no_selected_profile')
-                        self.message('已连接学生网，请选择或填写账号后登录。')
-                    elif selected.get('operator') not in ('telecom','unicom','cmcc','campus'):
+                        self.message('已连接校园网，请选择或填写账号后登录。')
+                    elif current.student and selected.get('operator') not in ('telecom','unicom','cmcc','campus'):
                         self.record('network.auto_login_skipped',reason='operator_not_selected')
                         self.message('已连接学生网，请选择账号对应的登录网络。')
                     else:
-                        result=self.login(selected['account'],selected['password'],selected['operator'],
+                        result=self.login(selected['account'],selected['password'],selected.get('operator',''),
                                           selected.get('id',''),automatic=True,expected=current)
                         if not result['ok']: self.message(result['message'])
                 except (RuntimeError,OSError) as exc:
@@ -1184,6 +1074,7 @@ def run_main(runtime_log):
     parser.add_argument('--watch',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--diagnose',action='store_true')
     parser.add_argument('--smoke-test',action='store_true')
+    parser.add_argument('--experimental',action='store_true',help='Use the isolated experimental profile and desktop identity')
     args=parser.parse_args()
     runtime_log.event('startup.options',startup=args.startup,watch=args.watch,smoke_test=args.smoke_test,diagnose=args.diagnose)
     if args.diagnose:
@@ -1192,7 +1083,8 @@ def run_main(runtime_log):
     kernel.CreateMutexW.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_wchar_p]
     kernel.CreateMutexW.restype=ctypes.c_void_p
     # Self-test is independent of an old user instance; normal use remains single-instance.
-    mutex_name='Local\\CumtCampusLoginSmokeV13' if args.smoke_test else 'Local\\CumtCampusLoginDesktopV1'
+    identity='CumtCampusLoginExperimental' if EXPERIMENTAL else 'CumtCampusLogin'
+    mutex_name='Local\\'+identity+('SmokeV13' if args.smoke_test else 'DesktopV1')
     mutex=kernel.CreateMutexW(None,False,mutex_name)
     already_running=ctypes.get_last_error()==183
     runtime_log.event('instance.checked',already_running=already_running)
@@ -1203,7 +1095,7 @@ def run_main(runtime_log):
     kernel.CreateEventW.restype=ctypes.c_void_p
     kernel.SetEvent.argtypes=[ctypes.c_void_p]
     kernel.WaitForSingleObject.argtypes=[ctypes.c_void_p,ctypes.c_uint]
-    event_name='Local\\CumtCampusLoginShowV13'
+    event_name='Local\\'+identity+'ShowV13'
     if already_running:
         runtime_log.event('instance.forwarding_to_running_client')
         event=kernel.OpenEventW(2,False,event_name)
@@ -1226,9 +1118,10 @@ def run_main(runtime_log):
     app.window.events.closing+=app.on_closing
     if args.smoke_test:
         app.wifi=core.read_wifi()
-        result={'mode':'packaged offline smoke test','version':core.VERSION,'campus_requests':0,'network_changes':0,
+        result={'mode':'packaged offline smoke test','version':core.VERSION,'success':False,'campus_requests':0,'network_changes':0,
                 'windows_app_identity':app_identity}
-        def check_ui():
+        smoke_error=[None]
+        def check_ui_checks():
             for _ in range(40):
                 time.sleep(.25)
                 if app.window.evaluate_js('!!window.clientReady'): break
@@ -1246,6 +1139,13 @@ def run_main(runtime_log):
                           client_ready=app.window.evaluate_js('!!window.clientReady'),
                           ui_logo_loaded=app.window.evaluate_js("(()=>{const image=document.querySelector('.logo img');return !!image&&image.complete&&image.naturalWidth>0})()"),
                           displayed_ssid=app.window.evaluate_js("document.getElementById('ssid').innerText"))
+            try:
+                from campus_browser import offline_self_test
+                result['webview2_compatibility']=offline_self_test()
+            except Exception as exc:
+                runtime_log.exception('smoke.webview2_compatibility_error',exc)
+                result['webview2_compatibility']={'engine':'webview2','success':False,
+                                                'error_type':type(exc).__name__}
             try:
                 result['native_icon']=verify_native_icon(app.window,icon_path)
             except Exception as exc:
@@ -1278,9 +1178,37 @@ def run_main(runtime_log):
                           native_window_restore=restored,
                           window_restore_verified=bool(restored.get('shown') and restored.get('native_verified')
                                                       and restored.get('visible') and not restored.get('minimized')))
-            result['success']=result['client_ready'] and result['displayed_ssid']==(app.wifi.ssid or '未连接网络') and result['ui_title']==TITLE and result['api_ready']=='function' and result['startup_switch'] and result['single_login_entry'] and result['profiles'] and result['no_tec_warning'] and result['independent_logout'] and result['status_refresh'] and result['network_check_entry'] and result['runtime_log_ready'] and result['diagnostic_zip_verified'] and result['online_identity_display'] and result['window_restore_verified'] and result['ui_logo_loaded'] and result['native_icon']['verified']
-            (Path(sys.executable).parent/'packaged_smoke_results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),'utf-8')
-            app.quit()
+            result['success']=result['client_ready'] and result['displayed_ssid']==(app.wifi.ssid or '未连接网络') and result['ui_title']==TITLE and result['api_ready']=='function' and result['startup_switch'] and result['single_login_entry'] and result['profiles'] and result['no_tec_warning'] and result['independent_logout'] and result['status_refresh'] and result['network_check_entry'] and result['runtime_log_ready'] and result['diagnostic_zip_verified'] and result['online_identity_display'] and result['window_restore_verified'] and result['ui_logo_loaded'] and result['native_icon']['verified'] and result['webview2_compatibility']['success']
+        def check_ui():
+            try:
+                check_ui_checks()
+                if not result.get('success'):
+                    raise RuntimeError('Packaged offline smoke checks did not pass.')
+                (Path(sys.executable).parent/'packaged_smoke_results.json').write_text(
+                    json.dumps(result,ensure_ascii=False,indent=2),'utf-8')
+            except BaseException as exc:
+                smoke_error[0]=exc
+                runtime_log.exception('smoke.check_error',exc)
+                try:
+                    write_smoke_failure(runtime_log,exc,result)
+                except OSError as artifact_error:
+                    runtime_log.exception('smoke.failure_artifact_error',artifact_error)
+            finally:
+                # Exactly one quit attempt, even when any UI/backend assertion
+                # fails. A smoke worker must not leave an invisible GUI alive.
+                try:
+                    app.quit()
+                except BaseException as exc:
+                    smoke_error[0]=smoke_error[0] or exc
+                    runtime_log.exception('smoke.quit_error',exc)
+                    try:write_smoke_failure(runtime_log,smoke_error[0],result)
+                    except OSError as artifact_error:
+                        runtime_log.exception('smoke.failure_artifact_error',artifact_error)
+                    try:
+                        from System.Windows.Forms import Application
+                        Application.Exit()
+                    except BaseException:
+                        pass
         webview.start(check_ui,gui='edgechromium',debug=False,private_mode=True,icon=str(icon_path))
     else:
         webview.start(app.started,gui='edgechromium',debug=False,private_mode=True,icon=str(icon_path))
@@ -1290,6 +1218,30 @@ def run_main(runtime_log):
     if app.notifications: app.notifications.close()
     if app.show_event: kernel.CloseHandle(app.show_event)
     kernel.CloseHandle(mutex)
+    if args.smoke_test and (smoke_error[0] is not None or not result.get('success')):
+        if smoke_error[0] is not None:raise smoke_error[0]
+        raise RuntimeError('Packaged offline smoke checks did not pass.')
+
+
+def write_smoke_failure(runtime_log,exc,result=None):
+    """Persist failure evidence outside the disposable self-test Store."""
+    target=Path(sys.executable).parent
+    report=dict(result or {})
+    report.update(version=core.VERSION,success=False,error_type=type(exc).__name__)
+    report=runtime_log.sanitize(report)
+    # Re-sanitize stored events with all now-known secrets before retaining
+    # them; never copy an unregistered exception string into the JSON report.
+    retained=[]
+    if runtime_log.path.is_file():
+        for line in runtime_log.path.read_text('utf-8').splitlines():
+            try:event=json.loads(line)
+            except ValueError:event={'event':'smoke.unparsed_log_line','text':line}
+            retained.append(json.dumps(runtime_log.sanitize(event),ensure_ascii=False))
+    (target/'packaged_smoke_failure.jsonl').write_text('\n'.join(retained)+'\n',encoding='utf-8')
+    (target/'packaged_smoke_results.json').write_text(
+        json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+    return report
+
 
 def main():
     import logging
@@ -1297,6 +1249,12 @@ def main():
     previous_data_root=core.data_root
     if smoke_root is not None:
         core.data_root=lambda:Path(smoke_root.name)
+    elif EXPERIMENTAL and not getattr(core,'EXPERIMENTAL_BUILD',False):
+        def experimental_data_root():
+            path=Path(os.environ.get('LOCALAPPDATA',str(Path.home()/'AppData'/'Local')))/STARTUP_VALUE_NAME
+            path.mkdir(parents=True,exist_ok=True)
+            return path
+        core.data_root=experimental_data_root
     root_error=None
     try:
         log_root=core.data_root()
@@ -1304,7 +1262,7 @@ def main():
         # Keep a writable recovery log if the normal user data directory cannot
         # be created. No existing credential/settings file is overwritten.
         root_error=exc
-        log_root=Path(tempfile.gettempdir())/'CumtCampusLogin-Recovery'
+        log_root=Path(tempfile.gettempdir())/(STARTUP_VALUE_NAME+'-Recovery')
         core.data_root=lambda:log_root
     log=RuntimeLog(log_root,core.VERSION,metadata={'python':sys.version,
         'frozen':bool(getattr(sys,'frozen',False)),'executable':str(sys.executable),'pid':os.getpid()})
@@ -1337,6 +1295,14 @@ def main():
         run_main(log)
     except BaseException as exc:
         log.exception('app.unhandled_exception',exc)
+        if smoke_root is not None:
+            try:
+                write_smoke_failure(log,exc)
+            except OSError as artifact_error:
+                log.exception('smoke.failure_artifact_error',artifact_error)
+            # SystemExit is handled by the frozen bootloader without a modal
+            # unhandled-exception window, releasing the smoke mutex promptly.
+            raise SystemExit(1) from None
         raise
     finally:
         threading.excepthook=previous_thread_hook

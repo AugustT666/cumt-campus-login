@@ -26,7 +26,8 @@ import queue
 import zlib
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 
-VERSION = '1.6.4'
+VERSION = '1.7.4'
+EXPERIMENTAL_BUILD = False
 STU = 'CUMT_Stu'
 TEC = 'CUMT_Tec'
 KNOWN_HOST = '10.2.5.251'
@@ -694,7 +695,8 @@ def protect(raw, decrypt=False):
         kernel.LocalFree(outgoing.data)
 
 def data_root():
-    root = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'CumtCampusLogin'
+    directory = 'CumtCampusLoginExperimental' if EXPERIMENTAL_BUILD else 'CumtCampusLogin'
+    root = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / directory
     root.mkdir(parents=True, exist_ok=True)
     return root
 

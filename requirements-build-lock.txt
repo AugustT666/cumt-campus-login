@@ -2,14 +2,11 @@ altgraph==0.17.5
 bottle==0.13.4
 cffi==2.1.1
 clr_loader==0.3.1
-greenlet==3.5.6
 packaging==26.3
 pefile==2024.8.26
 pip==26.2.2
-playwright==1.64.0
 proxy_tools==0.1.0
 pycparser==3.12
-pyee==14.0.0
 pyinstaller-hooks-contrib==2026.9
 pyinstaller==6.22.3
 pythonnet==3.2.1

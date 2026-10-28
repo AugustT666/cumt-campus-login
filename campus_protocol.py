@@ -219,6 +219,20 @@ def _string(text, name):
 
 def parse_jsonp(text):
     """Accept JSON or a single JSONP call, never generic success page text."""
+    return _parse_jsonp(text)
+
+
+def parse_status_jsonp(text):
+    """Allow the kernel's repeated, identical top-level olno telemetry only.
+
+    Live online status responses repeat this unused counter. Authentication
+    responses and every other duplicate remain subject to parse_jsonp's
+    strict rules; a conflicting or nested counter is never accepted.
+    """
+    return _parse_jsonp(text, allow_status_telemetry=True)
+
+
+def _parse_jsonp(text, *, allow_status_telemetry=False):
     if not isinstance(text, str) or len(text) > MAX_JSONP_BYTES:
         return None
     try:
@@ -253,12 +267,21 @@ def parse_jsonp(text):
                 return None
         elif ch in '}]':
             depth -= 1
+    repeated_counter_objects = []
     def unique_object(pairs):
         result = {}
+        repeated_counter = False
         for key, value in pairs:
             if key in result:
-                raise ValueError('Duplicate JSON field')
+                if (allow_status_telemetry and key == 'olno'
+                        and type(result[key]) is int and type(value) is int
+                        and result[key] >= 0 and result[key] == value):
+                    repeated_counter = True
+                else:
+                    raise ValueError('Duplicate JSON field')
             result[key] = value
+        if repeated_counter:
+            repeated_counter_objects.append(result)
         return result
     def finite_number(value):
         result = float(value)
@@ -271,6 +294,11 @@ def parse_jsonp(text):
         data = json.loads(payload, object_pairs_hook=unique_object,
                           parse_float=finite_number, parse_constant=reject_constant)
     except (ValueError, TypeError, RecursionError):
+        return None
+    # object_pairs_hook runs from the leaves upward. Compare the actual object
+    # identity after decoding to ensure the exception applies only to the root
+    # status object, never to an identically named field in a nested container.
+    if any(item is not data for item in repeated_counter_objects):
         return None
     return data if isinstance(data, dict) else None
 
@@ -622,7 +650,7 @@ class Engine:
         url = self.origin + '/drcom/chkstatus?' + urlencode({'callback': 'campus_status', '_': time.time_ns()})
         try:
             status, location, text = self._get(url)
-            data = parse_jsonp(text) if status == 200 and not location else None
+            data = parse_status_jsonp(text) if status == 200 and not location else None
             core.trace('protocol.status_response',status=status,
                        response_fields=sorted(data) if data else [],recognized=data is not None)
             if data is None:

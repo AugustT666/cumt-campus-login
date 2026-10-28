@@ -18,6 +18,8 @@ ACCOUNT, PASSWORD = 'fictional-review-user', 'fictional-review-password'
 
 class AppHardeningTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
+        self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.temp = tempfile.TemporaryDirectory()
         self.store = core.Store(Path(self.temp.name))
         with patch.object(core, 'Store', return_value=self.store):
@@ -104,7 +106,7 @@ class BrowserGateTests(unittest.TestCase):
                 "x.send(JSON.stringify({a:'login',username:document.querySelector('[name=DDDDD]').value,"
                 "password:document.querySelector('[name=upass]').value}));") if json_submit else (
                 "const x=new XMLHttpRequest();x.open('GET','/eportal/?a=login',false);x.send();")
-        html = ('<!doctype html><meta charset="utf-8"><form onsubmit="return false">'
+        html = ('<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><form onsubmit="return false">'
                 '<input name="DDDDD"><input name="upass" type="password" onchange="early()">'
                 + button * (2 if ambiguous else 1) + '</form><script>'
                 'function early(){' + early + '}function normal(){' + send

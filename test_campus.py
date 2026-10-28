@@ -198,6 +198,8 @@ class ProfileTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(a,'stable_autostart_configured',return_value=False))
+        self.enterContext(patch.object(a,'stable_instance_running',return_value=False))
         self.helper=a.App.__new__(a.App)
         self.helper.wifi=HOTSPOT
         self.helper.lock=__import__('threading').RLock()
@@ -310,10 +312,12 @@ class ClientTests(unittest.TestCase):
         with patch.object(c,'read_wifi',side_effect=[WIFI,HOTSPOT,WIFI,WIFI]):
             for _ in range(4): self.helper.poll_wifi()
         self.assertEqual(self.helper.login.call_count,2)
-    def test_teacher_never_auto_even_when_enabled(self):
+    def test_teacher_connect_attempts_once_when_enabled(self):
         self.helper.settings['stu_autostart']=True
-        with patch.object(c,'read_wifi',return_value=TEC): self.helper.poll_wifi()
-        self.helper.login.assert_not_called();self.helper.window.show.assert_not_called()
+        with patch.object(c,'read_wifi',return_value=TEC):
+            for _ in range(3): self.helper.poll_wifi()
+        self.helper.login.assert_called_once_with('fake-user','fake-password','telecom','chosen',automatic=True,expected=TEC)
+        self.helper.window.show.assert_called_once()
     def test_passive_wlan_notifications_register_and_close(self):
         listener=c.WifiNotifications()
         try: self.assertEqual(listener.drain(),[])
@@ -448,7 +452,7 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('[name=DDDDD]').nth(1).input_value(),'test&+@账号')
 
 class PortalIntegrationTests(unittest.TestCase):
-    """Real Edge DOM plus an entirely mocked, in-memory HTTP origin."""
+    """Real WebView2 DOM plus an entirely mocked, in-memory HTTP origin."""
     def run_portal(self,result_body,extra_click=False):
         submitted=[];configuration=[]
         page_html='''<!doctype html><meta charset="utf-8">
