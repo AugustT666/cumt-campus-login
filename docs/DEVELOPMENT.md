@@ -1,0 +1,50 @@
+# 开发说明
+
+## 版本与环境
+
+本快照对应 v1.6.4。版本用途及分支约定见 [版本说明](1.6.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
+
+需要 Windows、Python 3.12 和 WebView2 Runtime。v1.6.4 的门户兼容还需要系统已有 Edge 或 Chrome；v1.7.4 生产包使用独立 WebView2 控件。
+
+在仓库根目录执行：
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe campus_app.py
+```
+
+## 自动化检查
+
+先安装开发或构建依赖，再运行公开仓库自带的合成测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build-lock.txt
+.\.venv\Scripts\python.exe research/run_offline_tests.py
+.\.venv\Scripts\python.exe research/ui_smoke.py
+.\.venv\Scripts\python.exe research/ui_smoke.py --hidden
+```
+
+默认测试不读取真实账号、不提交校园网认证。它明确排除25项依赖本机门户抓取的集成检查，并在结果中逐项列出排除范围；实际运行的测试有任何跳过、失败或错误都不能满足交付条件。
+
+维护者若自行准备所需六份本地门户素材，可显式运行：
+
+```powershell
+.\.venv\Scripts\python.exe research/run_offline_tests.py --with-local-captures
+```
+
+素材位于 `.local/deep-audit/live-capture/` 下五份脚本及 `.local/portal-logout-audit/a79.htm`。缺失时此模式会明确失败，不会自动访问校园网或把未执行的检查算作通过。素材和生成报告均不进入 Git。
+
+## 构建
+
+源码检查通过后再构建。以下过程会验证冻结 EXE、图标、日志导出和当前源码指纹：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build-lock.txt
+.\.venv\Scripts\python.exe research/build_and_verify.py
+.\.venv\Scripts\python.exe research/package_current.py
+```
+
+报告与构建清单保留在本机，包含实际测试范围；应用能启动或合成测试通过，不代表所有校区、教师账号和运营商均已现场验证。修改产品或维护输入后，需重新生成匹配的检查结果。
+
+请勿提交个人账号、设置、诊断包、原始门户抓取、生成截图、构建环境或现场记录。仅保留可复用测试及维护脚本。
