@@ -26,7 +26,7 @@ import queue
 import zlib
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 
-VERSION = '1.7.4'
+VERSION = '1.7.5'
 EXPERIMENTAL_BUILD = False
 STU = 'CUMT_Stu'
 TEC = 'CUMT_Tec'

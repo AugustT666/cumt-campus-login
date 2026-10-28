@@ -2,9 +2,9 @@
 
 ## 版本与环境
 
-本快照对应 v1.7.4。版本用途及分支约定见 [版本说明](1.7.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
+本快照对应 v1.7.5。版本用途及分支约定见 [版本说明](1.7.4S.md)。Windows 应用源码保持对应版本；公开整理只移除了内部过程资料并调整维护工具。
 
-需要 Windows、Python 3.12 和 WebView2 Runtime。v1.6.4 的门户兼容还需要系统已有 Edge 或 Chrome；v1.7.4 生产包使用独立 WebView2 控件。
+需要 Windows、Python 3.12 和 WebView2 Runtime。v1.6.4 的门户兼容还需要系统已有 Edge 或 Chrome；当前 Windows 生产包使用独立 WebView2 控件。
 
 在仓库根目录执行：
 
