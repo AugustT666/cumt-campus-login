@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 import socket
 import tempfile
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -134,13 +135,30 @@ class LogoutRecoveryFixture(unittest.TestCase):
         self.enterContext(patch.object(app,'stable_autostart_configured',return_value=False))
         self.enterContext(patch.object(app,'stable_instance_running',return_value=False))
         self.client.wifi=self.wifi
+        self.client.portal='http://'+core.KNOWN_HOST+'/a79.htm'
         self.client.window=MagicMock()
         self.client.window.native=None
-        self.client.start_job=lambda kind,job,automatic=False:(job() or {'ok':True})
+        self.job_number=0
+        def run_job(kind,job,automatic=False):
+            if self.client.busy:return {'ok':False,'message':'Fictional busy'}
+            self.job_number+=1
+            self.client.busy=True
+            self.client.operation=kind
+            self.client.operation_id='fictional-job-'+str(self.job_number)
+            self.client.cancel.clear()
+            try:
+                job()
+                return {'ok':True}
+            finally:
+                self.client.busy=False
+                self.client.operation=''
+        self.client.start_job=run_job
+        self.launch=self.client._launch_logout_verification=MagicMock()
         self.client.save_profile=MagicMock(return_value={'ok':True})
         self.tick=100.0
         self.enterContext(patch.object(app.time,'monotonic',side_effect=lambda:self.tick))
         self.client._logout_wait=lambda seconds:self.advance(seconds)
+        self.client._logout_watch_wait=lambda watch,seconds:self.advance(seconds)
         self.internet_check=self.enterContext(patch.object(core,'internet_check',
             return_value={'online':False,'checks':[{'ok':False}]}))
         self.events=[]
@@ -154,6 +172,7 @@ class LogoutRecoveryFixture(unittest.TestCase):
         self.kernel_after_disconnect_online=False
         self.engine.status.side_effect=self.kernel_status
         self.client.session_engine=MagicMock(return_value=self.engine)
+        self.background_engine=self.enterContext(patch.object(app.protocol,'Engine',return_value=self.engine))
         self.native={'operation':'logout','phase':'response_received','backend':'verified_drcom_http',
             'authentication_requests':1,'result':False,'response':{'result':'0','msg':'Fictional rejected'}}
         self.native_result=False
@@ -190,6 +209,13 @@ class LogoutRecoveryFixture(unittest.TestCase):
 
     def recover(self,report=None):
         return self.client._recover_logout(self.wifi,online() if report is None else report,self.check_allowed)
+
+    def run_background(self):
+        watch=self.client._logout_watch
+        self.assertIsNotNone(watch)
+        self.launch.assert_called_once_with(watch)
+        self.client._run_logout_verification(watch)
+        return watch
 
 
 class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
@@ -304,12 +330,17 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.engine.status.side_effect=self.stable_portal_status
         start=self.tick
         self.assertTrue(self.client.logout()['ok'])
+        self.assertLess(self.tick-start,3.0)
+        self.assertFalse(self.client.busy)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+        self.assertTrue(self.client.get_state()['logout_recovery_needed'])
+        self.internet_check.assert_not_called()
+        self.run_background()
         self.client.run_authentication.assert_called_once()
         self.assertEqual(self.events,['portal'])
         self.web_factory.assert_not_called()
         self.assertEqual(self.web.login_calls,[])
         self.assertEqual(self.web.disconnect_calls,[])
-        self.assertGreaterEqual(self.tick-start,65.0)
         self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
         self.assertFalse(self.client.get_state()['logout_recovery_needed'])
 
@@ -317,9 +348,11 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.engine.status.side_effect=self.stable_portal_status
         start=self.tick
         self.assertTrue(self.client.logout()['ok'])
+        self.assertLess(self.tick-start,3.0)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+        self.run_background()
         self.client.run_authentication.assert_called_once()
         self.web_factory.assert_not_called()
-        self.assertGreaterEqual(self.tick-start,65.0)
         self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
         self.assertFalse(self.client.auth_diagnostic['result'])
         self.assertFalse(self.client.auth_diagnostic['selfservice_login_attempted'])
@@ -332,14 +365,17 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
             self.assertEqual(wifi,self.wifi)
             self.assertEqual(reader(),self.wifi)
             self.assertIs(allow_tec,self.SSID==core.TEC)
+            self.assertFalse(self.client.busy)
             return {'online':False,'checks':[{'ok':False}]}
         self.internet_check.side_effect=probe
         self.assertTrue(self.client.logout()['ok'])
-        self.internet_check.assert_called_once()
+        self.internet_check.assert_not_called()
+        self.run_background()
+        self.assertEqual(self.internet_check.call_count,2)
         self.web_factory.assert_not_called()
         self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
 
-    def test_normal_success_refreshes_manual_logout_hold_after_long_observation(self):
+    def test_normal_success_keeps_manual_logout_hold_during_background_verification(self):
         self.accepted_portal()
         self.engine.status.side_effect=self.stable_portal_status
         self.profiles['selected']='own-profile'
@@ -359,6 +395,8 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.engine.status.side_effect=self.stable_portal_status
         self.internet_check.return_value={'online':True,'checks':[{'ok':True}]}
         self.assertTrue(self.client.logout()['ok'])
+        self.web_factory.assert_not_called()
+        self.run_background()
         self.assert_portal_then_fallback()
         self.assertEqual(self.client.logout_diagnostic['fallback_reason'],'access_still_online')
         self.internet_check.assert_called_once()
@@ -371,8 +409,9 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
             return {'online':False,'checks':[]}
         self.internet_check.side_effect=change_status
         self.assertTrue(self.client.logout()['ok'])
+        self.run_background()
         self.assert_portal_then_fallback()
-        self.assertEqual(self.client.logout_diagnostic['fallback_reason'],'status_changed')
+        self.assertEqual(self.client.logout_diagnostic['fallback_reason'],'session_reappeared')
 
     def test_cancellation_during_final_access_probe_never_starts_fallback(self):
         self.accepted_portal()
@@ -381,10 +420,12 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
             self.client.cancel.set()
             return {'online':False,'checks':[]}
         self.internet_check.side_effect=cancel
-        with self.assertRaises(RuntimeError):self.client.logout()
+        self.assertTrue(self.client.logout()['ok'])
+        self.run_background()
         self.client.run_authentication.assert_called_once()
         self.internet_check.assert_called_once()
         self.web_factory.assert_not_called()
+        self.assertNotEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
 
     def test_network_change_during_final_access_probe_never_starts_fallback(self):
         self.accepted_portal()
@@ -393,16 +434,19 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
             self.current=replace(self.wifi,ip='10.61.55.11')
             return {'online':False,'checks':[]}
         self.internet_check.side_effect=change_network
-        with self.assertRaises(RuntimeError):self.client.logout()
+        self.assertTrue(self.client.logout()['ok'])
+        self.run_background()
         self.client.run_authentication.assert_called_once()
         self.internet_check.assert_called_once()
         self.web_factory.assert_not_called()
+        self.assertNotEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
 
     def test_normal_success_does_not_require_saved_selfservice_credentials(self):
         self.accepted_portal()
         self.profiles['profiles']=[]
         self.engine.status.side_effect=self.stable_portal_status
         self.assertTrue(self.client.logout()['ok'])
+        self.run_background()
         self.web_factory.assert_not_called()
         self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
 
@@ -411,8 +455,8 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         start=self.tick
         self.assertTrue(self.client.logout()['ok'])
         self.assert_portal_then_fallback()
-        self.assertGreaterEqual(self.tick-start,10.0)
-        self.assertLess(self.tick-start,65.0)
+        self.assertGreaterEqual(self.tick-start,2.0)
+        self.assertLess(self.tick-start,15.0)
 
     def test_transient_offline_then_online_uses_fallback_without_green_success(self):
         self.accepted_portal()
@@ -420,7 +464,7 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.assertTrue(self.client.logout()['ok'])
         self.assert_portal_then_fallback()
 
-    def test_reappearance_after_forty_seconds_is_caught_before_claiming_success(self):
+    def test_forty_second_reappearance_triggers_background_fallback_after_fast_return(self):
         self.accepted_portal()
         def late_reappearance():
             if not self.portal_ran:return online()
@@ -429,8 +473,12 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.engine.status.side_effect=late_reappearance
         start=self.tick
         self.assertTrue(self.client.logout()['ok'])
+        self.assertLess(self.tick-start,3.0)
+        self.web_factory.assert_not_called()
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+        self.run_background()
         self.assert_portal_then_fallback()
-        self.assertGreaterEqual(self.tick-start,45.0)
+        self.assertGreaterEqual(self.tick-start,40.0)
         self.assertLess(self.tick-start,65.0)
 
     def test_unconfirmed_status_after_portal_success_uses_fallback(self):
@@ -476,10 +524,24 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.engine.status.side_effect=self.stable_portal_status
         def cancel_later(seconds):
             self.advance(seconds)
-            if self.tick-self.portal_started>=2.0:self.client.cancel.set()
+            self.client.cancel.set()
         self.client._logout_wait=cancel_later
         with self.assertRaises(RuntimeError):self.client.logout()
         self.web_factory.assert_not_called()
+        self.launch.assert_not_called()
+
+    def test_manual_login_intent_during_the_primary_response_cancels_old_logout_without_fallback(self):
+        self.accepted_portal()
+        self.engine.status.side_effect=self.stable_portal_status
+        requested=[]
+        self.on_primary=lambda:requested.append(self.client.login(ACCOUNT,PASSWORD,'campus'))
+        with self.assertRaises(RuntimeError):self.client.logout()
+        self.assertEqual(len(requested),1)
+        self.assertFalse(requested[0]['ok'])
+        self.assertIsNone(self.client._logout_watch)
+        self.client.run_authentication.assert_called_once()
+        self.web_factory.assert_not_called()
+        self.launch.assert_not_called()
 
     def test_stale_login_diagnostic_is_reset_before_unknown_logout_preflight(self):
         self.client.auth_diagnostic={'operation':'login','backend':'Fictional stale',
@@ -669,25 +731,30 @@ class PortalLogoutConfirmationTests(LogoutRecoveryFixture):
         return self.client._confirm_portal_logout(self.wifi,self.SSID==core.TEC,
                                                  self.check_allowed,report)
 
-    def test_normal_offline_requires_full_observation_without_selfservice(self):
+    def test_normal_offline_returns_quickly_without_selfservice_or_external_probe(self):
         self.engine.status.side_effect=lambda:offline()
         start=self.tick
         success,last=self.confirm()
         self.assertTrue(success)
         self.assertEqual(last['state'],'offline')
-        self.assertGreaterEqual(self.tick-start,65.0)
+        self.assertGreaterEqual(self.tick-start,.5)
+        self.assertLess(self.tick-start,3.0)
+        self.assertGreaterEqual(self.engine.status.call_count,2)
         self.web_factory.assert_not_called()
+        self.internet_check.assert_not_called()
         self.assertTrue(all(call.args[1] is (self.SSID==core.TEC)
                             for call in self.client.session_engine.call_args_list))
 
-    def test_initial_online_propagation_does_not_shorten_offline_observation(self):
+    def test_brief_propagation_is_followed_by_two_fast_offline_samples(self):
         start=self.tick
-        self.engine.status.side_effect=lambda:online() if self.tick-start<8.0 else offline()
+        self.engine.status.side_effect=lambda:online() if self.tick-start<1.0 else offline()
         success,last=self.confirm()
         self.assertTrue(success)
         self.assertEqual(last['state'],'offline')
-        self.assertGreaterEqual(self.tick-start,73.0)
+        self.assertGreaterEqual(self.tick-start,1.5)
+        self.assertLess(self.tick-start,3.0)
         self.web_factory.assert_not_called()
+        self.internet_check.assert_not_called()
 
     def test_still_online_at_propagation_deadline_is_not_confirmed(self):
         self.engine.status.side_effect=lambda:online()
@@ -695,18 +762,18 @@ class PortalLogoutConfirmationTests(LogoutRecoveryFixture):
         success,last=self.confirm()
         self.assertFalse(success)
         self.assertEqual(last['state'],'online')
-        self.assertGreaterEqual(self.tick-start,10.0)
-        self.assertLess(self.tick-start,65.0)
+        self.assertGreaterEqual(self.tick-start,2.0)
+        self.assertLess(self.tick-start,3.0)
         self.web_factory.assert_not_called()
 
-    def test_forty_second_reappearance_is_not_mistaken_for_normal_success(self):
+    def test_possible_late_reappearance_does_not_block_the_foreground(self):
         start=self.tick
         self.engine.status.side_effect=lambda:offline() if self.tick-start<40.0 else online()
         success,last=self.confirm()
-        self.assertFalse(success)
-        self.assertEqual(last['state'],'online')
-        self.assertGreaterEqual(self.tick-start,40.0)
-        self.assertLess(self.tick-start,65.0)
+        self.assertTrue(success)
+        self.assertEqual(last['state'],'offline')
+        self.assertLess(self.tick-start,3.0)
+        self.internet_check.assert_not_called()
         self.web_factory.assert_not_called()
 
     def test_unknown_readback_never_claims_normal_success(self):
@@ -720,6 +787,289 @@ class PortalLogoutConfirmationTests(LogoutRecoveryFixture):
         self.client.cancel.set()
         with self.assertRaises(RuntimeError):self.confirm()
         self.web_factory.assert_not_called()
+
+
+class BackgroundLogoutVerificationTests(LogoutRecoveryFixture):
+    def begin_fast_logout(self):
+        self.native_result=True
+        self.native.update(result=True,response={'result':'1'})
+        self.engine.status.side_effect=lambda:offline() if self.portal_ran else online()
+        start=self.tick
+        self.assertTrue(self.client.logout()['ok'])
+        self.assertLess(self.tick-start,3.0)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+        self.assertFalse(self.client.busy)
+        return self.client._logout_watch
+
+    def test_observer_uses_an_independent_engine_without_reserving_a_foreground_job(self):
+        watch=self.begin_fast_logout()
+        self.client.session_engine.reset_mock()
+        self.run_background()
+        self.background_engine.assert_called_once()
+        args,kwargs=self.background_engine.call_args
+        self.assertEqual(args,(self.wifi,watch['portal']))
+        self.assertIs(kwargs['allow_tec'],self.SSID==core.TEC)
+        self.assertTrue(callable(kwargs['reader']))
+        self.client.session_engine.assert_not_called()
+        self.assertFalse(self.client.busy)
+        self.web_factory.assert_not_called()
+
+    def test_a_slow_access_probe_does_not_hold_the_ui_busy(self):
+        watch=self.begin_fast_logout()
+        entered=threading.Event()
+        release=threading.Event()
+        def probe(*args,**kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3),'Fictional probe was not released')
+            return {'online':False,'checks':[{'ok':False}]}
+        self.internet_check.side_effect=probe
+        worker=threading.Thread(target=self.client._run_logout_verification,args=(watch,))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertFalse(self.client.busy)
+            self.assertEqual(self.client.operation,'')
+            self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+            self.web_factory.assert_not_called()
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
+
+    def test_manual_login_during_a_slow_probe_discards_old_results_and_fallback(self):
+        watch=self.begin_fast_logout()
+        entered=threading.Event()
+        release=threading.Event()
+        def probe(*args,**kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=probe
+        worker=threading.Thread(target=self.client._run_logout_verification,args=(watch,))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.client.start_job=MagicMock(return_value={'ok':True})
+            self.assertTrue(self.client.login(ACCOUNT,PASSWORD,'campus')['ok'])
+            self.assertIsNone(self.client._logout_watch)
+            self.client.session_state='online'
+            self.client.logged_in=True
+            self.client.status='Fictional newer login'
+            self.client.auth_diagnostic={'operation':'login','result':True}
+            self.client._logout_recovery_needed=False
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.client.session_state,'online')
+        self.assertTrue(self.client.logged_in)
+        self.assertEqual(self.client.status,'Fictional newer login')
+        self.assertEqual(self.client.auth_diagnostic,{'operation':'login','result':True})
+        self.assertFalse(self.client._logout_recovery_needed)
+        self.web_factory.assert_not_called()
+
+    def test_new_logout_intent_during_a_slow_probe_cannot_be_overwritten(self):
+        watch=self.begin_fast_logout()
+        entered=threading.Event()
+        release=threading.Event()
+        def probe(*args,**kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=probe
+        worker=threading.Thread(target=self.client._run_logout_verification,args=(watch,))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertTrue(self.client.logout()['ok'])
+            self.assertIsNot(self.client._logout_watch,watch)
+            newest=self.client._logout_watch
+            newest_result=deepcopy(self.client.logout_diagnostic)
+            newest_requests=list(self.web.disconnect_calls)
+            self.client.status='Fictional newer logout'
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertIs(self.client._logout_watch,newest)
+        self.assertEqual(self.client.status,'Fictional newer logout')
+        self.assertEqual(self.client.logout_diagnostic,newest_result)
+        self.assertEqual(self.web.disconnect_calls,newest_requests)
+
+    def test_readonly_observer_defers_to_a_foreground_job(self):
+        self.begin_fast_logout()
+        self.engine.status.reset_mock()
+        self.client.busy=True
+        self.client.operation='status'
+        waits=[]
+        def defer(watch,seconds):
+            waits.append(seconds)
+            if len(waits)==1:
+                self.assertLessEqual(seconds,.2)
+                self.engine.status.assert_not_called()
+                self.internet_check.assert_not_called()
+                self.client.busy=False
+                self.client.operation=''
+            return self.advance(seconds)
+        self.client._logout_watch_wait=defer
+        self.run_background()
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
+        self.web_factory.assert_not_called()
+
+    def test_unknown_background_state_is_bounded_and_does_not_authorize_selfservice(self):
+        watch=self.begin_fast_logout()
+        start=self.tick
+        self.engine.status.side_effect=lambda:{'state':'unknown','detail':'Fictional unavailable'}
+        self.run_background()
+        self.assertGreaterEqual(self.tick-start,60.0)
+        self.assertLess(self.tick-start,70.0)
+        self.assertFalse(watch['verifying'])
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'unconfirmed')
+        self.assertTrue(self.client._logout_recovery_needed)
+        self.internet_check.assert_not_called()
+        self.web_factory.assert_not_called()
+
+    def test_unknown_then_recovered_offline_state_restores_the_confirmation_message(self):
+        self.begin_fast_logout()
+        start=self.tick
+        def status():
+            elapsed=self.tick-start
+            return {'state':'unknown','detail':'Fictional unavailable'} if 3<=elapsed<6 else offline()
+        self.engine.status.side_effect=status
+        self.run_background()
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
+        self.assertFalse(self.client._logout_recovery_needed)
+        self.assertEqual(self.client.status,'已退出登录')
+        self.web_factory.assert_not_called()
+
+    def test_same_address_reconnect_generation_invalidates_the_old_observer(self):
+        watch=self.begin_fast_logout()
+        def reconnect(*args,**kwargs):
+            self.client._invalidate_logout_route('fictional_same_address_reconnect')
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=reconnect
+        self.run_background()
+        self.assertFalse(watch['verifying'])
+        self.assertNotEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
+        self.web_factory.assert_not_called()
+
+    def test_mac_change_with_the_same_legacy_key_stops_the_old_observer(self):
+        watch=self.begin_fast_logout()
+        changed=replace(self.wifi,mac='00-11-22-33-44-66')
+        self.assertEqual(changed.key,self.wifi.key)
+        def change(*args,**kwargs):
+            self.current=changed
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=change
+        self.run_background()
+        self.assertFalse(watch['verifying'])
+        self.web_factory.assert_not_called()
+
+    def test_an_inflight_probe_finishing_after_the_deadline_can_only_fallback_once(self):
+        watch=self.begin_fast_logout()
+        def late(*args,**kwargs):
+            self.advance(70)
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=late
+        self.run_background()
+        self.assertFalse(watch['verifying'])
+        self.assertTrue(watch['fallback_started'])
+        self.assertEqual(self.client.logout_diagnostic['fallback_reason'],'access_still_online')
+        self.assertEqual(self.web.disconnect_calls,[OWN.session_id])
+        self.client._run_logout_verification(watch)
+        self.assertEqual(self.web.disconnect_calls,[OWN.session_id])
+
+    def test_an_inflight_probe_after_its_intent_is_replaced_cannot_publish_or_disconnect(self):
+        watch=self.begin_fast_logout()
+        replacement={'ssid':self.SSID.casefold(),'guid':self.wifi.guid,
+                     'started':self.tick,'saw_offline':False}
+        def late(*args,**kwargs):
+            self.advance(70)
+            self.client._stop_logout_verification()
+            self.client._logout_watch=replacement
+            self.client.status='Fictional later intent'
+            self.client.session_state='online'
+            self.client.logged_in=True
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=late
+        self.run_background()
+        self.assertFalse(watch['verifying'])
+        self.assertIs(self.client._logout_watch,replacement)
+        self.assertEqual(self.client.status,'Fictional later intent')
+        self.assertEqual(self.client.session_state,'online')
+        self.assertTrue(self.client.logged_in)
+        self.web_factory.assert_not_called()
+
+    def test_accepted_automatic_login_replaces_the_watch_even_when_global_cancel_is_clear(self):
+        watch=self.begin_fast_logout()
+        entered=threading.Event()
+        release=threading.Event()
+        accepted=threading.Event()
+        def probe(*args,**kwargs):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=probe
+        worker=threading.Thread(target=self.client._run_logout_verification,args=(watch,))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.client.start_job=app.App.start_job.__get__(self.client,app.App)
+            def new_login():
+                self.client.session_state='online'
+                self.client.logged_in=True
+                self.client.status='Fictional accepted automatic login'
+                accepted.set()
+            self.assertTrue(self.client.start_job('login',new_login,automatic=True)['ok'])
+            self.assertTrue(accepted.wait(3))
+            self.assertIsNone(self.client._logout_watch)
+            self.assertFalse(self.client.cancel.is_set())
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.client.status,'Fictional accepted automatic login')
+        self.assertEqual(self.client.session_state,'online')
+        self.assertTrue(self.client.logged_in)
+        self.web_factory.assert_not_called()
+
+    def test_external_access_reappearing_at_the_end_of_observation_uses_one_fallback(self):
+        watch=self.begin_fast_logout()
+        start=self.tick
+        def probe(*args,**kwargs):
+            return {'online':self.tick-start>=55.0,'checks':[]}
+        self.internet_check.side_effect=probe
+        self.run_background()
+        self.assertEqual(self.internet_check.call_count,2)
+        self.assertTrue(watch['fallback_started'])
+        self.assertEqual(self.client.logout_diagnostic['fallback_reason'],'access_still_online')
+        self.assertEqual(self.web.disconnect_calls,[OWN.session_id])
+        self.assertGreaterEqual(self.tick-start,55.0)
+        self.assertIn(OTHER,self.web.devices)
+
+    def test_closed_app_discards_the_old_probe_without_any_fallback(self):
+        watch=self.begin_fast_logout()
+        def close(*args,**kwargs):
+            self.client.closed.set()
+            return {'online':True,'checks':[{'ok':True}]}
+        self.internet_check.side_effect=close
+        self.run_background()
+        self.assertFalse(watch['verifying'])
+        self.web_factory.assert_not_called()
+
+    def test_background_fallback_keeps_the_original_account_and_is_at_most_once(self):
+        watch=self.begin_fast_logout()
+        self.engine.status.side_effect=self.kernel_status
+        self.run_background()
+        self.assertEqual(self.web.login_calls,[(ACCOUNT,PASSWORD)])
+        self.assertEqual(self.web.disconnect_calls,[OWN.session_id])
+        self.assertIn(OTHER,self.web.devices)
+        self.assertTrue(watch['fallback_started'])
+        self.assertFalse(watch['verifying'])
+        self.client._run_logout_verification(watch)
+        self.assertEqual(self.web.disconnect_calls,[OWN.session_id])
+        self.assertEqual(self.web.close_calls,1)
 
 
 class LogoutAutomaticSuppressionTests(LogoutRecoveryFixture):
@@ -798,6 +1148,10 @@ class StuLogoutConfirmationTests(CampusLogoutConfirmationTests):
 
 
 class StuPortalLogoutConfirmationTests(PortalLogoutConfirmationTests):
+    SSID=core.STU
+
+
+class StuBackgroundLogoutVerificationTests(BackgroundLogoutVerificationTests):
     SSID=core.STU
 
 

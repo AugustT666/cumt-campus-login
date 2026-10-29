@@ -11,13 +11,13 @@
 <div class="field-wrap" id="operator-wrap"><label class="field" for="operator">登录网络</label><select id="operator"><option value="">请选择</option><option value="telecom">中国电信</option><option value="unicom">中国联通</option><option value="cmcc">中国移动</option><option value="campus">校园网</option></select></div>
 <div class="row"><div><span class="label">连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出</span><span class="note">后台监听，连接后弹出；有已保存账号时自动尝试一次</span></div><button id="startup" class="switch" role="switch" aria-checked="false" aria-label="连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出" onclick="changeStartup()"></button></div>
 <div class="status" id="status" aria-live="polite" tabindex="0" aria-label="运行状态">请连接 CUMT_Stu 或 CUMT_Tec</div><div class="session-actions"><button class="primary" id="login-button" onclick="toggleLogin()">登录</button><button class="plain" id="logout-button" onclick="logoutSession()" disabled>注销</button></div>
-<footer><button class="link" onclick="showHelp()">帮助</button><a class="link" id="session-recovery" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer" aria-label="核对设备状态，打开校园网自助服务" hidden>自助服务</a><span id="version">v1.7.7</span><button class="link" onclick="quitApp()">退出</button></footer>
+<footer><button class="link" onclick="showHelp()">帮助</button><a class="link" id="session-recovery" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer" aria-label="核对设备状态，打开校园网自助服务" hidden>自助服务</a><span id="version">v1.7.8</span><button class="link" onclick="quitApp()">退出</button></footer>
 </main>
 <dialog id="help"><h2>使用帮助</h2>
 <div class="help-line">连接 <b>CUMT_Stu</b>，填写账号密码并选择登录网络；<b>CUMT_Tec</b> 无需选择网络。切换已登录账号前，请先“注销”。</div>
 <div class="help-line">开启自动弹出后，连接校园网（CUMT_Stu/CUMT_Tec）会自动弹出登录器，并用选中的已保存账号尝试登录一次。此时监听器仍在后台运行，点“退出”则完全退出并关闭弹出监听。</div>
 <div class="help-line">若遇“系统拒绝连接（10013）”，可检查安全软件的出站权限；如使用 Tailscale Exit Node 或其他 VPN/代理，也可尝试停用相关功能后重试，未使用则跳过。</div>
-<div class="help-line">仍有问题时，可先“网络自检”，再“导出诊断包”求助。学生网和教师网都先正常注销；无法完成时，才用已保存账号通过<a id="campus-self-service" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer">校园网自助服务</a>精准下线本机。需要验证码或无法核对设备时，请手动处理。</div>
+<div class="help-line">仍有问题时，可先“网络自检”，再“导出诊断包”求助。学生网和教师网均先正常注销，并在后台核对结果；无法完成时，才用已保存账号通过<a id="campus-self-service" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer">校园网自助服务</a>精准下线本机。需要验证码或无法核对设备时，请手动处理。</div>
 <div class="buttons"><button class="plain" id="network-check" onclick="checkNetwork()">网络自检</button><button class="plain" id="diagnostic-export" onclick="exportDiagnostic()">导出诊断包</button></div>
 <details id="help-advanced"><summary>高级设置</summary><p>找不到认证页面时，填写浏览器中的校园网认证地址。</p><input id="portal_hint" aria-label="校园网认证地址" placeholder="http://10.x.x.x/…"><div class="buttons"><button class="plain" id="portal-save" onclick="saveHint()">保存地址</button></div></details>
 <div class="buttons"><button class="primary" onclick="el('help').close()">完成</button></div></dialog>
