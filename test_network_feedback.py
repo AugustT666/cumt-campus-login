@@ -96,6 +96,7 @@ class AppNetworkFeedbackTests(unittest.TestCase):
         self.client.run_authentication = MagicMock(return_value=True)
         self.client.save_profile = MagicMock(return_value={'ok': True})
         self.client.start_job = lambda kind, job, automatic=False: (job() or {'ok': True})
+        self.client._launch_logout_verification = MagicMock()
         self.enterContext(patch.object(core, 'read_wifi', return_value=WIFI))
         self.enterContext(patch.object(core, 'discover', side_effect=AssertionError('No discovery allowed')))
         self.enterContext(patch.object(socket.socket, 'connect', side_effect=AssertionError('No live sockets')))

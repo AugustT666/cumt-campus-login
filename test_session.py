@@ -23,6 +23,7 @@ class SessionTests(unittest.TestCase):
         with patch.object(core,'Store',return_value=self.store):
             self.app=app.App()
         self.app.wifi=WIFI
+        self.app.portal='http://'+core.KNOWN_HOST+'/a79.htm'
         self.app.settings['quiet_hours']=False
         self.engine=MagicMock()
         self.engine.status.return_value={'state':'offline','matched_ip':True}
@@ -30,11 +31,14 @@ class SessionTests(unittest.TestCase):
         self.app.run_authentication=MagicMock(return_value=True)
         self.app.save_profile=MagicMock(return_value={'ok':True})
         self.app.start_job=lambda kind,job,automatic=False:(job() or {'ok':True})
+        self.app._launch_logout_verification=MagicMock()
+        self.enterContext(patch.object(app.protocol,'Engine',return_value=self.engine))
         self.wifi_patch=patch.object(core,'read_wifi',return_value=WIFI)
         self.wifi_patch.start()
         self.tick=100.0
         self.enterContext(patch.object(app.time,'monotonic',side_effect=lambda:self.tick))
         self.app._logout_wait=lambda seconds:setattr(self,'tick',self.tick+seconds)
+        self.app._logout_watch_wait=lambda watch,seconds:setattr(self,'tick',self.tick+seconds)
         self.enterContext(patch.object(core,'internet_check',return_value={'online':False,'checks':[]}))
         self.service_client=self.enterContext(patch.object(selfservice,'Client',
             side_effect=AssertionError('No live self-service in session tests')))
@@ -82,7 +86,10 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.app.logged_in)
         self.assertEqual(self.app.session_state,'offline')
         self.assertGreater(self.engine.status.call_count,2)
-        self.assertGreaterEqual(self.tick-start,65.0)
+        self.assertLess(self.tick-start,3.0)
+        self.assertEqual(self.app.logout_diagnostic['outcome'],'verification_pending')
+        self.app._run_logout_verification(self.app._logout_watch)
+        self.assertEqual(self.app.logout_diagnostic['outcome'],'offline_confirmed')
         self.service_client.assert_not_called()
     def test_logout_offline_sends_no_authentication(self):
         self.assertTrue(self.app.logout()['ok'])
@@ -392,11 +399,14 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
         self.service_client.assert_not_called()
-        self.assertGreaterEqual(self.tick-start,65.0)
+        self.assertLess(self.tick-start,3.0)
+        self.assertEqual(self.app.logout_diagnostic['outcome'],'verification_pending')
+        self.app._run_logout_verification(self.app._logout_watch)
+        self.assertEqual(self.app.logout_diagnostic['outcome'],'offline_confirmed')
         self.assertFalse(self.app.logged_in)
         self.assertEqual(self.app.get_state()['online_account'],'')
         self.assertEqual(self.app.get_state()['identity_source'],'')
         self.assertFalse(self.app.auth_diagnostic['result'])
-        self.assertIn('持续确认离线',self.app.status)
+        self.assertEqual('已退出登录',self.app.status)
 
 if __name__=='__main__':unittest.main()

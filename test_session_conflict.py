@@ -70,6 +70,7 @@ class ConflictFixture(unittest.TestCase):
         self.client.operation_id = 'fixture-initial'
         self.jobs = 0
         self.client.start_job = self.inline_job
+        self.client._launch_logout_verification = MagicMock()
         self.tick = 100.0
         self.enterContext(patch.object(app.time, 'monotonic', side_effect=lambda: self.tick))
         self.client._logout_wait = lambda seconds: setattr(self, 'tick', self.tick + seconds)
