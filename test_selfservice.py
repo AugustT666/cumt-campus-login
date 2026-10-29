@@ -397,6 +397,164 @@ def nas_target(**changes):
     return 'http://10.2.5.251/a79.htm?'+urlencode(values)
 
 
+class SubmitCurrentTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(core,'Store',side_effect=AssertionError('No Store')))
+        self.h=Harness()
+        self.tick=100.0
+        self.nas_calls=[]
+        self.sleeps=[]
+
+    def nas_getter(self,url,wifi,reader,allow_tec):
+        self.assertEqual(reader(),WIFI)
+        self.nas_calls.append(url)
+        return 302,nas_target(),''
+
+    def login(self,reader=None,cleanup_reader=None):
+        c=self.h.client(reader=reader,cleanup_reader=cleanup_reader,
+            nas_getter=self.nas_getter,clock=lambda:self.tick)
+        self.addCleanup(c.close)
+        c.login(ACCOUNT,PASSWORD)
+        c._sleep=lambda seconds:self.sleeps.append(seconds)
+        return c
+
+    def assert_submission_only(self,start):
+        self.assertEqual([p for _,p,*_ in self.h.requests[start:]],
+                         [service.ONLINE_LIST,service.ONLINE_LIST,service.DISCONNECT])
+        self.assertEqual(self.sleeps,[])
+        self.assertEqual(self.h.count(service.DISCONNECT),1)
+        self.assertEqual(self.h.count(service.ONLINE_LIST),2)
+
+    def test_server_success_returns_ack_without_device_readback_or_sleep(self):
+        c=self.login();start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertIs(result['request_accepted'],True)
+        self.assertIsNone(result['session_removed'])
+        self.assertIsNone(result['current_device_offline'])
+        self.assertNotIn('verified',result)
+        self.assertEqual(self.h.devices,[OTHER])
+        self.assertEqual(self.nas_calls,[])
+        self.assertNotIn('selfservice.disconnect_checked',[e for e,_ in self.h.traces])
+
+    def test_rejection_is_not_repaired_by_polling_or_another_submission(self):
+        c=self.login();self.h.logout_body={'success':False};start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertIs(result['request_accepted'],False)
+        self.assertIsNone(result['session_removed'])
+        self.assertIsNone(result['current_device_offline'])
+        with self.assertRaises(service.SelfServiceError):c.submit_current()
+        with self.assertRaises(service.SelfServiceError):c.disconnect_current()
+        self.assert_submission_only(start)
+
+    def test_lost_response_has_unknown_ack_and_is_never_retried(self):
+        c=self.login();self.h.fail_after_disconnect=True;start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertIsNone(result['request_accepted'])
+        self.assertIsNone(result['current_device_offline'])
+        with self.assertRaises(service.SelfServiceError):c.submit_current()
+        self.assert_submission_only(start)
+
+    def test_nonboolean_success_is_unknown_without_postchecks(self):
+        c=self.login();self.h.logout_body={'success':'true'};start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertIsNone(result['request_accepted'])
+        self.assertIsNone(result['session_removed'])
+        self.assertIsNone(result['current_device_offline'])
+
+    def test_missing_ack_is_unknown_without_postchecks(self):
+        c=self.login();self.h.logout_body={};start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertIsNone(result['request_accepted'])
+
+    def test_cancellation_before_wire_sends_no_action(self):
+        c=self.login()
+        def stop():raise RuntimeError('Fictional cancelled before request')
+        with self.assertRaises(RuntimeError):c.submit_current(before_disconnect=stop)
+        self.assertEqual(self.h.count(service.ONLINE_LIST),2)
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(c.safe_summary()['disconnect_requests'],0)
+        self.assertEqual(self.sleeps,[])
+
+    def test_changed_session_or_owner_in_second_precheck_sends_no_action(self):
+        c=self.login()
+        self.h.list_responses=[[OWN,OTHER],[dict(OWN,sessionId='fictional-new-session'),OTHER]]
+        with self.assertRaises(service.AmbiguousDevice):c.submit_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_another_device_at_current_ip_is_not_selected(self):
+        c=self.login();self.h.devices=[dict(OWN,mac=OTHER['mac']),OTHER]
+        with self.assertRaises(service.NoMatchingDevice):c.submit_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(self.nas_calls,[])
+
+    def test_ghost_submission_keeps_nas_prechecks_but_has_no_readback(self):
+        self.h.devices=[dict(OWN,mac='000000000000'),OTHER]
+        c=self.login();start=len(self.h.requests)
+        result=c.submit_current()
+        self.assert_submission_only(start)
+        self.assertEqual(len(self.nas_calls),1)
+        self.assertIs(result['request_accepted'],True)
+        self.assertIsNone(result['session_removed'])
+        self.assertIsNone(result['current_device_offline'])
+        self.assertEqual(self.h.devices,[OTHER])
+
+    def test_expiry_after_tcp_connect_still_blocks_ghost_submission(self):
+        self.h.devices=[dict(OWN,mac='000000000000'),OTHER]
+        original=self.h.factory
+        def slow_connect(*args):
+            conn=original(*args)
+            conn.connect=lambda:setattr(self,'tick',self.tick+service.NAS_BINDING_TTL+1)
+            return conn
+        self.h.factory=slow_connect
+        c=self.login()
+        with self.assertRaises(service.UnsupportedService):c.submit_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(c.safe_summary()['disconnect_requests'],0)
+
+    def test_response_is_not_followed_by_a_native_network_check(self):
+        current=[WIFI];after_response=[False];late_reads=[]
+        def reader():
+            if after_response[0]:late_reads.append(True)
+            return current[0]
+        original=self.h.factory
+        def factory(*args):
+            conn=original(*args);getresponse=conn.getresponse
+            def receive():
+                response=getresponse()
+                if urlsplit(conn.request_data[1]).path==service.DISCONNECT:
+                    after_response[0]=True
+                    current[0]=replace(WIFI,ip='10.61.42.11')
+                return response
+            conn.getresponse=receive
+            return conn
+        self.h.factory=factory
+        c=self.login(reader=reader,cleanup_reader=lambda:WIFI)
+        result=c.submit_current()
+        self.assertEqual(late_reads,[])
+        self.assertIs(result['request_accepted'],True)
+        self.assertIsNone(result['current_device_offline'])
+
+    def test_concurrent_submit_current_calls_send_exactly_once(self):
+        c=self.login();barrier=threading.Barrier(2);results=[];errors=[]
+        def attempt():
+            barrier.wait()
+            try:results.append(c.submit_current())
+            except service.SelfServiceError as exc:errors.append(type(exc))
+        threads=[threading.Thread(target=attempt) for _ in range(2)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(2);self.assertFalse(thread.is_alive())
+        self.assertEqual(len(results),1)
+        self.assertEqual(len(errors),1)
+        self.assertEqual(self.h.count(service.DISCONNECT),1)
+        self.assertEqual(self.h.count(service.ONLINE_LIST),2)
+        self.assertEqual(self.sleeps,[])
+
+
 class NasBindingTests(unittest.TestCase):
     def setUp(self):
         self.current=WIFI
@@ -472,9 +630,21 @@ class NasBindingTests(unittest.TestCase):
         with self.assertRaises(service.UnsupportedService):self.observe()
 
     def test_literal_js_redirects_are_recognized_without_executing_code(self):
-        for script in ("location.href='URL';",'window.location.replace("URL");',"top.location='URL';"):
+        for script in ("location.href='URL';",'window.location.replace("URL");',"top.location='URL';",
+                       "top.self.location.href='URL';",'top.self.location.replace("URL");'):
             self.response=(200,'','<html><script>'+script.replace('URL',nas_target())+'</script></html>')
             self.assertEqual(self.observe().portal_url,nas_target())
+
+    def test_top_self_literal_does_not_authorize_extra_statements_or_expressions(self):
+        scripts=["top.self.location.href='URL';fetch('/extra');",
+                 "top.self.location.href='URL'+suffix;",
+                 "top.self.location.href=chooseUrl();",
+                 "top.self.location.href='URL';// extra source",
+                 "var text=\"top.self.location.href='URL'\";"]
+        for script in scripts:
+            with self.subTest(script=script):
+                self.response=(200,'','<script>'+script.replace('URL',nas_target())+'</script>')
+                with self.assertRaises(service.UnsupportedService):self.observe()
 
     def test_comments_strings_multiple_scripts_and_nonliteral_js_are_not_proof(self):
         scripts=["// location.href='URL';",'var text="location.href=\'URL\'";',

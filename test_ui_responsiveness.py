@@ -45,7 +45,6 @@ class UIResponsivenessTests(LogoutRecoveryFixture):
                 release.wait(3)
             return self.current
         self.reader.side_effect=native_read
-        if kind=='logout':self.engine.status.side_effect=lambda:offline()
         try:
             requested=(self.client.login(ACCOUNT,PASSWORD,'campus','own-profile')
                        if kind=='login' else self.client.logout())
@@ -84,40 +83,6 @@ class UIResponsivenessTests(LogoutRecoveryFixture):
             release.set()
             self.wait_job()
 
-    def test_background_publish_native_sample_is_outside_state_lock(self):
-        self.native_result=True
-        self.native.update(result=True,response={'result':'1'})
-        self.engine.status.side_effect=lambda:offline() if self.portal_ran else online()
-        self.assertTrue(self.client.logout()['ok'])
-        watch=self.client._logout_watch
-        entered=threading.Event()
-        release=threading.Event()
-        queries=[]
-        worker=None
-        def native_read():
-            if threading.current_thread() is worker:
-                queries.append(self.client.lock._is_owned())
-                # The old observer's second explicit guard was nested inside
-                # its state-commit lock. Stall exactly that publication sample.
-                if len(queries)==2:
-                    entered.set()
-                    release.wait(3)
-            return self.current
-        self.reader.side_effect=native_read
-        worker=threading.Thread(target=self.client._run_logout_verification,args=(watch,))
-        try:
-            worker.start()
-            self.assertTrue(entered.wait(1))
-            self.assertFalse(self.poll_state_while_blocked()['busy'])
-            available=self.client.lock.acquire(blocking=False)
-            self.assertTrue(available,'native publication read retained the App state lock')
-            if available:self.client.lock.release()
-        finally:
-            release.set()
-            worker.join(3)
-        self.assertFalse(worker.is_alive())
-        self.assertGreater(len(queries),2)
-        self.assertFalse(any(queries),'a background native guard ran inside the App state lock')
 
     def test_blocked_log_writer_does_not_block_state_polling(self):
         self.client.get_state()

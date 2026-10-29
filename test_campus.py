@@ -372,7 +372,15 @@ class ClientTests(unittest.TestCase):
         engine.status.return_value={'state':'offline','matched_ip':True}
         self.helper.session_engine=MagicMock(return_value=engine)
         self.helper.portal='http://10.2.5.251/a79.htm';self.helper.portal_key=TEC.key
-        self.helper.start_job=lambda kind,job,automatic=False: (job() or {'ok':True})
+        def accepted_job(kind,job,automatic=False):
+            self.helper.operation_id='fictional-teacher-operation'
+            self.helper.operation=kind;self.helper.busy=True;self.helper.cancel.clear()
+            try:
+                job()
+                return {'ok':True}
+            finally:
+                self.helper.busy=False;self.helper.operation=''
+        self.helper.start_job=accepted_job
         with patch.object(c,'read_wifi',return_value=TEC):
             result=self.helper.login('fake-teacher','fake-password','')
         self.assertTrue(result['ok'])

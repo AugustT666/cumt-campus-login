@@ -1,4 +1,4 @@
-"""Single-device Self-service fallback, with fixed origin and no credential store.
+"""Single-device Self-service submission, with fixed origin and no credential store.
 
 The endpoints and form semantics follow the school's observed Self pages.
 Only a fresh authenticated cookie jar may list and disconnect its own session.
@@ -149,7 +149,7 @@ def _raw_nas_target(seed, status, location, text):
         if parser.invalid or parser.current is not None or len(parser.blocks) != 1:
             return ''
         script = parser.blocks[0]
-    prefix = r'(?:(?:window|top|self)\.)?location'
+    prefix = r'(?:(?:window|top|self)\.){0,3}location'
     match = re.fullmatch(r'\s*(?:' + prefix + r'(?:\.href)?\s*=\s*(' + literal + r')|'
                          + prefix + r'\.replace\s*\(\s*(' + literal + r')\s*\))\s*;?\s*', script)
     if match is None:
@@ -595,7 +595,11 @@ class SelfServiceClient:
             if len(raw) > MAX_BODY:
                 raise UnsupportedService('自助服务响应过大，已停止。')
             text = core.decode_text(raw, clean)
-            self._guard(cleanup)
+            # The mutation is already sent and its response has arrived. Return
+            # its acknowledgment directly; later device verification belongs to
+            # explicit developer checks, not the production submission path.
+            if p.path != DISCONNECT:
+                self._guard(cleanup)
             self._record('selfservice.http_result', path=p.path, method=method,
                          status=response.status, elapsed_ms=round((time.monotonic()-started)*1000))
             return response.status, location, text
@@ -693,8 +697,8 @@ class SelfServiceClient:
             self._record('selfservice.binding_verified', proof_type='nas_current_ip', verified=True)
             return candidates[0]
 
-    @_serialized
-    def disconnect_current(self, session_info=None, before_disconnect=None):
+    def _submit_current(self, session_info=None, before_disconnect=None):
+        """Resolve one current device and submit once; callers hold the operation lock."""
         if self._disconnect_attempted:
             raise SelfServiceError('本次自助下线已经提交过，未重复发送。')
         selected = self.select_current_session(self.list_online_devices(), session_info)
@@ -725,6 +729,18 @@ class SelfServiceClient:
         finally:
             self._pending_session = None
             self._pending_nas_binding = None
+        return selected
+
+    @_serialized
+    def submit_current(self, session_info=None, before_disconnect=None):
+        """Return the server's single-request acknowledgment without post-checks."""
+        self._submit_current(session_info, before_disconnect)
+        return self.safe_summary()
+
+    @_serialized
+    def disconnect_current(self, session_info=None, before_disconnect=None):
+        """Development verification helper; production uses submit_current."""
+        selected = self._submit_current(session_info, before_disconnect)
         absent_samples, seen_absent = 0, False
         for delay in (0, 1, 2, 3):  # elapsed 0/1/3/6 seconds, reads only
             try:

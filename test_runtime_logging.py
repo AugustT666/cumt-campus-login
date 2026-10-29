@@ -115,7 +115,7 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
             self.assertTrue(selected, event)
             self.assertTrue(all(row['operation_id'] == operation_id for row in selected), event)
         self.assertEqual(snapshot['authentication']['phase'], 'fixture_failure')
-        self.assertEqual(snapshot['session']['state'], 'offline')
+        self.assertEqual(snapshot['session']['state'], 'unknown')
         self.assertEqual(snapshot['wifi']['ip'], WIFI.ip)
         self.assertEqual(snapshot['wifi']['mac'], WIFI.mac)
         self.assertFalse(snapshot['network_configuration_changes'])
@@ -230,7 +230,7 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
                 self.execute(lambda: self.client.login(ACCOUNT, password, 'campus'))
                 engine.prepare.assert_called_once()
                 engine.authenticate.assert_called_once()
-                self.assertEqual(self.client.session_state, 'online' if outcome else 'offline')
+                self.assertEqual(self.client.session_state, 'online' if outcome else 'unknown')
                 diagnostic = self.client.auth_diagnostic
                 self.assertIs(diagnostic['result'], outcome)
                 self.assertEqual(diagnostic['authentication_requests'], 1)
