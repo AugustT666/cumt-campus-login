@@ -4,6 +4,7 @@ No real Store, registry, WiFi interface, credential file or authentication is us
 """
 from dataclasses import replace
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -38,6 +39,10 @@ class CampusBothFixture(unittest.TestCase):
         self.client.wifi = HOTSPOT
         self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
         self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
+        self.enterContext(patch.object(socket.socket,'connect',
+            side_effect=AssertionError('No real sockets in campus automation tests')))
+        self.probes=self.enterContext(patch.object(core,'internet_check',
+            side_effect=AssertionError('No network effect checks in the application')))
 
 
 class CampusBothPopupTests(CampusBothFixture):
@@ -156,7 +161,7 @@ class CampusBothLoginGuardTests(CampusBothFixture):
         self.current = TEC
         self.client.wifi = TEC
         self.engine = MagicMock()
-        self.engine.status.return_value = {'state': 'offline', 'matched_ip': True}
+        self.engine.status.side_effect=AssertionError('No retired status preflight')
         self.client.session_engine = MagicMock(return_value=self.engine)
         self.client.run_authentication = MagicMock(return_value=False)
         self.client.save_profile = MagicMock(return_value={'ok': True})
@@ -213,19 +218,29 @@ class CampusBothLoginGuardTests(CampusBothFixture):
         self.assertFalse(self.login()['ok'])
         self.client.run_authentication.assert_not_called()
 
-    def test_teacher_unknown_status_never_sends_authentication(self):
-        self.engine.status.return_value = {'state': 'unknown'}
+    def test_teacher_login_sends_one_action_without_querying_status(self):
         self.assertTrue(self.login()['ok'])
-        self.client.run_authentication.assert_not_called()
+        self.client.run_authentication.assert_called_once()
+        self.engine.status.assert_not_called()
+        self.probes.assert_not_called()
 
     def preflight_mutation(self, mutate):
-        def status():
+        wire=[]
+        def authenticate(*args,before_submit=None,**kwargs):
             mutate()
-            return {'state': 'offline', 'matched_ip': True}
-        self.engine.status.side_effect = status
+            before_submit()
+            wire.append('credential-submission')
+            return False,{'operation':'login','authentication_requests':1,'result':False}
+        self.engine.authenticate.side_effect=authenticate
+        self.client.run_authentication=MagicMock(wraps=app.App.run_authentication.__get__(self.client,app.App))
         with self.assertRaises(RuntimeError):
             self.login()
-        self.client.run_authentication.assert_not_called()
+        self.client.run_authentication.assert_called_once()
+        self.engine.prepare.assert_called_once()
+        self.engine.authenticate.assert_called_once()
+        self.engine.status.assert_not_called()
+        self.probes.assert_not_called()
+        self.assertEqual(wire,[])
 
     def test_cancel_during_teacher_preflight_stops_before_submission(self):
         self.preflight_mutation(self.client.cancel.set)
@@ -241,6 +256,16 @@ class CampusBothLoginGuardTests(CampusBothFixture):
 
     def test_address_change_during_teacher_preflight_stops_submission(self):
         self.preflight_mutation(lambda: setattr(self, 'current', replace(TEC, ip='10.61.140.9')))
+
+    def test_mac_change_before_teacher_wire_stops_submission(self):
+        changed=replace(TEC,mac='00-11-22-33-44-66')
+        self.assertEqual(changed.key,TEC.key)
+        self.preflight_mutation(lambda:setattr(self,'current',changed))
+
+    def test_gateway_change_before_teacher_wire_stops_submission(self):
+        changed=replace(TEC,gateway='10.61.140.2')
+        self.assertEqual(changed.key,TEC.key)
+        self.preflight_mutation(lambda:setattr(self,'current',changed))
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Adversarial regressions: fictional accounts, temporary store, in-memory HTTP."""
 import json
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
@@ -27,10 +28,20 @@ class AppHardeningTests(unittest.TestCase):
         self.client.wifi = WIFI
         self.client.settings['quiet_hours'] = False
         self.engine = MagicMock()
+        self.engine.status.side_effect = AssertionError('Status checks are not part of login')
+        self.probes = self.enterContext(patch.object(core,'internet_check',
+            side_effect=AssertionError('No effect probes in the application')))
+        self.enterContext(patch.object(socket.socket,'connect',
+            side_effect=AssertionError('No real sockets in App hardening tests')))
         self.client.session_engine = MagicMock(return_value=self.engine)
         self.client.run_authentication = MagicMock(return_value=True)
         self.client.save_profile = MagicMock(return_value={'ok': True})
-        self.client.start_job = lambda kind, job, automatic=False: (job() or {'ok': True})
+        def execute_job(kind,job,automatic=False):
+            with patch.object(app.threading,'Thread') as thread:
+                result=app.App.start_job(self.client,kind,job,automatic)
+                if result['ok']:thread.call_args.kwargs['target']()
+                return result
+        self.client.start_job=execute_job
         self.wifi_patch = patch.object(core, 'read_wifi', return_value=WIFI)
         self.wifi_patch.start()
 
@@ -58,41 +69,47 @@ class AppHardeningTests(unittest.TestCase):
         self.client.run_authentication.assert_not_called()
         self.assertTrue(self.client.on_closing())
 
-    def test_success_response_cannot_override_explicit_offline_readback(self):
-        self.engine.status.side_effect = [{'state': 'offline'}, {'state': 'offline'}]
+    def test_success_ack_records_receipt_without_status_or_effect_probes(self):
         self.login()
-        self.assertFalse(self.client.logged_in)
-        self.assertEqual(self.client.session_state, 'offline')
-        self.assertEqual(self.client.session_diagnostic['state'], 'offline')
-        self.assertIn('已接受', self.client.status)
-        self.assertIn('离线', self.client.status)
+        self.assertTrue(self.client.logged_in)
+        self.assertEqual(self.client.session_state, 'online')
+        self.assertEqual(self.client.session_diagnostic['source'], 'request_ack')
+        self.assertFalse(self.client.session_diagnostic['verification_performed'])
+        self.assertIn('登录成功', self.client.status)
         self.client.run_authentication.assert_called_once()
+        self.engine.status.assert_not_called()
+        self.probes.assert_not_called()
 
-    def test_success_response_with_unknown_or_failed_readback_never_claims_online(self):
-        for after in ({'state': 'unknown'}, RuntimeError('fixture status unavailable')):
-            with self.subTest(after=type(after).__name__):
-                self.engine.status.side_effect = [{'state': 'offline'}, after]
+    def test_rejected_and_unknown_acks_do_not_request_readback_or_claim_success(self):
+        for result in (False,None):
+            with self.subTest(result=result):
+                self.client.run_authentication.return_value=result
                 self.login()
                 self.assertFalse(self.client.logged_in)
                 self.assertEqual(self.client.session_state, 'unknown')
-                self.assertIn('尚未确认', self.client.status)
+                self.assertIn('失败' if result is False else '未知', self.client.status)
+                self.assertNotIn('登录成功',self.client.status)
+                self.assertIs(self.client.auth_diagnostic['request_accepted'],result)
         self.assertEqual(self.client.run_authentication.call_count, 2)
+        self.engine.status.assert_not_called()
+        self.probes.assert_not_called()
 
-    def test_success_response_with_online_readback_confirms_server_identity(self):
-        self.engine.status.side_effect = [{'state': 'offline'},
-            {'state': 'online', 'online_account': 'fictional-server-identity'}]
+    def test_success_receipt_identity_is_submitted_account_not_server_observation(self):
         self.login()
         self.assertTrue(self.client.logged_in)
-        self.assertEqual(self.client.online_account, 'fictional-server-identity')
+        self.assertEqual(self.client.online_account, ACCOUNT)
+        self.assertEqual(self.client.identity_source,'request_ack')
+        self.assertNotEqual(self.client.identity_source,'server')
+        self.engine.status.assert_not_called()
+        self.probes.assert_not_called()
 
     def test_quiet_override_is_one_manual_attempt_and_never_applies_to_automatic_jobs(self):
         self.client.settings.update(quiet_hours=True, stu_autostart=True)
-        self.engine.status.return_value = {'state': 'offline'}
         with patch.object(core, 'quiet_hours', return_value=True):
             self.login(quiet_override=True)
             self.client.run_authentication.assert_called_once()
-            with self.assertRaisesRegex(RuntimeError, '不可认证时间'):
-                self.login(automatic=True, quiet_override=True)
+            self.assertTrue(self.login(automatic=True, quiet_override=True)['ok'])
+            self.assertIn('不可认证',self.client.status)
         self.client.run_authentication.assert_called_once()
         self.assertTrue(self.client.settings['quiet_hours'])
 
@@ -233,8 +250,11 @@ class QuietOverrideUiTests(unittest.TestCase):
             page.locator('#quiet-confirm .plain').click()
             page.evaluate("window.fixture.session_state='online';state=window.fixture")
             page.locator('#login-button').click()
+            self.assertTrue(page.locator('#quiet-confirm').is_visible())
+            self.assertEqual(page.evaluate('window.calls.length'),1)
+            page.locator('#quiet-confirm .primary').click()
             page.wait_for_function('window.calls.length===2&&!actionBusy')
-            self.assertIs(page.evaluate('window.calls[1][4]'),False)
+            self.assertIs(page.evaluate('window.calls[1][4]'),True)
             context.close()
             browser.close()
 
