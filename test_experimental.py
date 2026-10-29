@@ -197,13 +197,16 @@ class ExperimentalCoexistenceTests(unittest.TestCase):
         save.assert_not_called()
         create.assert_not_called()
 
-    def test_old_dual_run_configuration_stops_trial_before_a_job_is_started(self):
+    def test_old_dual_run_configuration_stops_trial_in_worker_before_authentication(self):
         self.autostart.return_value = True
         self.client.auth_diagnostic = {'operation': 'login', 'authentication_requests': 1}
         result = self.client.login('fictional-user', 'fictional-password', 'campus', automatic=True)
-        self.assertFalse(result['ok'])
-        self.assertIn('启动项配置', result['message'])
+        self.assertTrue(result['ok'])
+        self.wait_idle()
+        self.assertIn('启动项配置', self.client.status)
+        self.client.session_engine.assert_not_called()
         self.client.run_authentication.assert_not_called()
+        self.assertEqual(self.requests, [])
         self.assertFalse(self.client.busy)
         self.assertEqual(self.client.auth_diagnostic['authentication_requests'], 0)
         self.assertEqual(self.client.auth_diagnostic['phase'], 'coexistence_blocked')

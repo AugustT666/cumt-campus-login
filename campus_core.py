@@ -26,7 +26,7 @@ import queue
 import zlib
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 
-VERSION = '1.7.8'
+VERSION = '1.7.9'
 EXPERIMENTAL_BUILD = False
 STU = 'CUMT_Stu'
 TEC = 'CUMT_Tec'
@@ -356,7 +356,13 @@ def fresh_url(url, wifi):
             continue
         if low in DYNAMIC_KEYS:
             if 'mac' in low:
-                value, found_mac = wifi.mac, True
+                # A live NAS may use case-sensitive device keys. Keep its exact
+                # spelling only when it still identifies this physical adapter.
+                normalized=re.sub(r'[-:]','',value).casefold()
+                current=re.sub(r'[-:]','',wifi.mac).casefold()
+                if not re.fullmatch(r'[0-9a-f]{12}',normalized) or normalized!=current:
+                    value=wifi.mac
+                found_mac=True
             else:
                 value, found_ip = wifi.ip, True
         pairs.append((key, value))

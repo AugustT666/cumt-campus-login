@@ -11,12 +11,16 @@ import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode
+from itertools import chain, repeat
 import zipfile
 
 import campus_app as app
 import campus_core as core
 import campus_selfservice as selfservice
 from campus_logging import RuntimeLog
+
+_ISSUE_NAS_PROOF=selfservice.observe_nas_binding
 
 
 TEC = core.Wifi(core.TEC, 'conflict-fixture', 7, '10.61.20.8',
@@ -77,6 +81,8 @@ class ConflictFixture(unittest.TestCase):
         self.enterContext(patch.object(core, 'internet_check', return_value={'online': False, 'checks': []}))
         self.service_client = self.enterContext(patch.object(selfservice, 'Client',
             side_effect=AssertionError('No live self-service in conflict tests')))
+        self.nas_observer = self.enterContext(patch.object(selfservice,'observe_nas_binding',
+            side_effect=selfservice.UnsupportedService('Fictional NAS proof unavailable')))
         self.enterContext(patch.object(socket.socket, 'connect',
             side_effect=AssertionError('No live sockets in conflict tests')))
 
@@ -240,6 +246,140 @@ class SessionConflictTests(ConflictFixture):
         self.assertEqual(self.client.session_state, 'unknown')
         self.assertFalse(self.client.logged_in)
         self.client.check_unconfirmed_internet_later.assert_not_called()
+
+
+class FreshNasConflictTests(ConflictFixture):
+    """A real issued proof may resolve stale shared status; a guessed one may not."""
+    def proof(self,wifi=TEC):
+        target='http://'+core.KNOWN_HOST+'/a79.htm?'+urlencode({
+            'wlanuserip':wifi.ip,'mac':wifi.mac,'wlanacname':'fictional-current-ac',
+            'nasip':'10.9.8.7'})
+        def redirect(url,current,reader,allow_tec):
+            self.assertEqual(current,wifi)
+            self.assertEqual(reader(),wifi)
+            return 302,target,''
+        return _ISSUE_NAS_PROOF(wifi,reader=lambda:wifi,getter=redirect,
+                                clock=lambda:self.tick)
+
+    def supply(self,proof):
+        self.nas_observer.side_effect=None
+        self.nas_observer.return_value=proof
+
+    def assert_no_authentication(self):
+        self.client.run_authentication.assert_not_called()
+        self.assertEqual(self.client.auth_diagnostic['authentication_requests'],0)
+        self.service_client.assert_not_called()
+
+    def test_current_raw_redirect_proof_allows_one_manual_login(self):
+        self.supply(self.proof())
+        self.assertTrue(self.login()['ok'])
+        self.client.run_authentication.assert_called_once()
+        self.assertEqual(self.client.run_authentication.call_args.args[4],'login')
+        self.assertTrue(self.events('authentication.conflict_resolved'))
+        self.service_client.assert_not_called()
+        self.assertFalse(self.client.logged_in)
+        self.assertIn('已接受登录',self.client.status)
+
+    def test_current_raw_redirect_proof_tries_ordinary_logout_before_any_service(self):
+        self.supply(self.proof())
+        self.engine.status.side_effect=chain([conflict()],repeat(offline()))
+        self.assertTrue(self.client.logout()['ok'])
+        self.client.run_authentication.assert_called_once()
+        self.assertEqual(self.client.run_authentication.call_args.args[4],'logout')
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'verification_pending')
+        self.assertEqual(self.client.logout_diagnostic['portal_requests'],1)
+        self.service_client.assert_not_called()
+        self.client._launch_logout_verification.assert_called_once()
+
+    def test_constructed_but_not_issued_proof_cannot_authorize_login(self):
+        signed=self.proof()
+        self.supply(selfservice.NasBinding(signed.portal_url,signed.context,signed.observed_at))
+        self.login()
+        self.assert_no_authentication()
+
+    def test_expired_proof_cannot_authorize_login_or_ordinary_logout(self):
+        signed=self.proof()
+        self.tick+=selfservice.NAS_BINDING_TTL+.01
+        self.supply(signed)
+        self.login()
+        self.assert_no_authentication()
+        self.client.logout()
+        self.assert_no_authentication()
+
+    def test_proof_for_a_different_physical_context_cannot_authorize_authentication(self):
+        self.supply(self.proof(replace(TEC,ip='10.61.20.9')))
+        self.login()
+        self.assert_no_authentication()
+
+    def test_network_change_after_observation_stops_before_submission(self):
+        signed=self.proof()
+        def observe(*args,**kwargs):
+            self.reader.return_value=replace(TEC,mac='00-11-22-33-44-66')
+            return signed
+        self.nas_observer.side_effect=observe
+        self.login()
+        self.assert_no_authentication()
+
+    def test_proof_expiring_during_native_prepare_stops_before_credential_submission(self):
+        signed=self.proof()
+        self.supply(signed)
+        self.engine.portal=signed.portal_url
+        def prepare():
+            self.tick+=selfservice.NAS_BINDING_TTL+.01
+            return {'login_method':'2'}
+        self.engine.prepare.side_effect=prepare
+        self.client.run_authentication=app.App.run_authentication.__get__(self.client,app.App)
+        with self.assertRaises(selfservice.UnsupportedService):
+            self.login()
+        self.engine.authenticate.assert_not_called()
+        self.assertEqual(self.client.auth_diagnostic['authentication_requests'],0)
+        self.service_client.assert_not_called()
+
+    def test_browser_fallback_receives_the_live_nas_guard_and_releases_it_after_auth(self):
+        signed=self.proof()
+        self.supply(signed)
+        self.engine.portal=signed.portal_url
+        self.engine.prepare.side_effect=app.protocol.UnsupportedPortal('Fictional original-page fallback')
+        self.client.run_authentication=app.App.run_authentication.__get__(self.client,app.App)
+        guards=[]
+        def browser(*args,**kwargs):
+            reader=kwargs['reader']
+            self.assertIs(reader,self.client._browser_auth_guard)
+            self.assertEqual(reader(),TEC)
+            guards.append(reader)
+            self.client.auth_diagnostic={'operation':'login','authentication_requests':1,'result':True}
+            return True
+        with patch('campus_browser.authenticate',side_effect=browser) as authenticate:
+            self.assertTrue(self.login()['ok'])
+        authenticate.assert_called_once()
+        self.engine.authenticate.assert_not_called()
+        self.assertIsNone(self.client._browser_auth_guard)
+        self.tick+=selfservice.NAS_BINDING_TTL+.01
+        self.assertEqual(guards[0](),TEC,'portal-only proof was retained beyond its completed operation')
+        self.service_client.assert_not_called()
+
+    def test_browser_guard_rejects_expiry_before_any_credential_request(self):
+        signed=self.proof()
+        self.supply(signed)
+        self.engine.portal=signed.portal_url
+        def prepare():
+            self.tick+=selfservice.NAS_BINDING_TTL+.01
+            raise app.protocol.UnsupportedPortal('Fictional original-page fallback')
+        self.engine.prepare.side_effect=prepare
+        self.client.run_authentication=app.App.run_authentication.__get__(self.client,app.App)
+        wire=[]
+        def browser(*args,**kwargs):
+            kwargs['reader']()
+            wire.append('fictional-credential-request')
+            return None
+        with patch('campus_browser.authenticate',side_effect=browser):
+            with self.assertRaises(selfservice.UnsupportedService):
+                self.login()
+        self.assertEqual(wire,[])
+        self.engine.authenticate.assert_not_called()
+        self.assertEqual(self.client.auth_diagnostic['authentication_requests'],0)
+        self.assertIsNone(self.client._browser_auth_guard)
+        self.service_client.assert_not_called()
 
 
 class UnconfirmedConnectivityTests(ConflictFixture):

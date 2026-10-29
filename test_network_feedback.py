@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 import zipfile
@@ -106,6 +108,8 @@ class AppNetworkFeedbackTests(unittest.TestCase):
         self.enterContext(patch.object(core, 'internet_check', return_value={'online': False, 'checks': []}))
         self.service_client = self.enterContext(patch.object(selfservice, 'Client',
             side_effect=AssertionError('No live self-service in network feedback tests')))
+        self.nas_observer = self.enterContext(patch.object(selfservice,'observe_nas_binding',
+            side_effect=selfservice.UnsupportedService('Fictional NAS proof unavailable')))
 
     def tearDown(self):
         self.client.runtime_log.close()
@@ -161,6 +165,39 @@ class AppNetworkFeedbackTests(unittest.TestCase):
         self.assertEqual(self.client.session_state, 'unknown')
         self.assertEqual(self.client.session_diagnostic['network_error']['winerror'], 10013)
         self.assertNotEqual(self.client.logout_diagnostic['outcome'], 'offline_confirmed')
+
+    def test_cancel_returns_while_native_preflight_is_still_blocked(self):
+        self.client.start_job=app.App.start_job.__get__(self.client,app.App)
+        entered=threading.Event()
+        release=threading.Event()
+        returned=threading.Event()
+        result={}
+        def slow_native():
+            entered.set()
+            release.wait(3)
+            return WIFI
+        with patch.object(core,'read_wifi',side_effect=slow_native):
+            try:
+                self.assertTrue(self.client.logout()['ok'])
+                self.assertTrue(entered.wait(1))
+                def cancel():
+                    result.update(self.client.cancel_operation())
+                    returned.set()
+                thread=threading.Thread(target=cancel)
+                thread.start()
+                self.assertTrue(returned.wait(.3),'cancel waited behind native WLAN preflight')
+                thread.join(1)
+                self.assertTrue(result['ok'])
+                self.assertTrue(self.client.cancel.is_set())
+            finally:
+                release.set()
+                deadline=time.perf_counter()+3
+                while self.client.busy and time.perf_counter()<deadline:
+                    threading.Event().wait(.005)
+                self.assertFalse(self.client.busy)
+        self.client.run_authentication.assert_not_called()
+        self.service_client.assert_not_called()
+        self.nas_observer.assert_not_called()
 
     def test_other_unknown_status_still_allows_explicit_manual_attempt(self):
         self.engine.status.return_value = {'state': 'unknown',

@@ -77,10 +77,13 @@ class FakeWebClient:
         devices=self.device_last if self.device_last is not None else self.devices
         return list(devices)
 
+    def select_current_session(self,devices,session_info=None):
+        return service.select_current_session(devices,self.wifi,session_info)
+
     def disconnect_current(self,session_info=None,before_disconnect=None):
         if self.disconnect_calls:raise service.SelfServiceError('Fictional duplicate disconnect')
-        selected=service.select_current_session(self.list_online_devices(),self.wifi,session_info)
-        verified=service.select_current_session(self.list_online_devices(),self.wifi,session_info)
+        selected=self.select_current_session(self.list_online_devices(),session_info)
+        verified=self.select_current_session(self.list_online_devices(),session_info)
         if selected!=verified:raise service.AmbiguousDevice('Fictional changed target')
         if before_disconnect:before_disconnect()
         self.disconnect_calls.append(selected.session_id)
@@ -167,6 +170,8 @@ class LogoutRecoveryFixture(unittest.TestCase):
             self.events.append('selfservice')
             return self.web
         self.web_factory=self.enterContext(patch.object(service,'Client',side_effect=service_client))
+        self.nas_observer=self.enterContext(patch.object(service,'observe_nas_binding',
+            side_effect=service.UnsupportedService('Fictional NAS proof unavailable')))
         self.engine=MagicMock()
         self.kernel_sequence=[]
         self.kernel_after_disconnect_online=False
@@ -277,8 +282,8 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         self.client.run_authentication.assert_not_called()
         self.assertEqual(self.web.disconnect_calls,[])
         self.assertNotEqual(self.client.logout_diagnostic['outcome'],'offline_confirmed')
-        self.assertGreaterEqual(self.tick-start,45.0)
-        self.assertLessEqual(self.tick-start,46.0)
+        self.assertGreaterEqual(self.tick-start,app.LOGOUT_SESSION_LOOKUP_TIMEOUT)
+        self.assertLessEqual(self.tick-start,app.LOGOUT_SESSION_LOOKUP_TIMEOUT+1.0)
         self.assertEqual(self.client.session_state,'offline')
         self.assertTrue(self.client.get_state()['logout_recovery_needed'])
         self.assertEqual(self.web.close_calls,1)
@@ -288,7 +293,10 @@ class CampusLogoutRecoveryTests(LogoutRecoveryFixture):
         start=self.tick
         self.assertTrue(self.client.logout()['ok'])
         self.assert_portal_then_fallback()
-        self.assertGreaterEqual(self.tick-start,9.0)
+        self.assertGreaterEqual(self.tick-start,
+            min(4.0,app.LOGOUT_SESSION_LOOKUP_TIMEOUT)+app.LOGOUT_STABLE_SECONDS)
+        self.assertLessEqual(self.tick-start,
+            app.LOGOUT_SESSION_LOOKUP_TIMEOUT+app.LOGOUT_CONFIRM_TIMEOUT)
 
     def test_initial_unknown_uses_precise_fallback_without_blind_portal_mutation(self):
         self.profiles['selected']='own-profile'
@@ -724,6 +732,26 @@ class CampusLogoutConfirmationTests(LogoutRecoveryFixture):
         self.web.devices=[OTHER]
         self.web.disconnected=True
         self.assertTrue(self.confirm()[0])
+
+    def late_current_ip_entry(self,mac):
+        # The module's first six seconds may already have looked clean. A new
+        # record at second seven must still prevent the App's final success.
+        self.tick+=6
+        appears=self.tick+1
+        ghost=service.DeviceSession('fictional-late-ip-session',self.wifi.ip,mac,71)
+        self.web.disconnected=True
+        self.web.list_online_devices=MagicMock(side_effect=lambda:
+            [OTHER,ghost] if self.tick>=appears else [OTHER])
+        success,last=self.confirm()
+        self.assertFalse(success)
+        self.assertEqual(last['state'],'offline')
+        self.assertFalse(self.client.logout_diagnostic['verification']['account_device_absent'])
+
+    def test_late_current_ip_record_without_mac_prevents_offline_confirmation(self):
+        self.late_current_ip_entry('')
+
+    def test_late_current_ip_record_with_different_valid_mac_prevents_confirmation(self):
+        self.late_current_ip_entry('66778899AABB')
 
 
 class PortalLogoutConfirmationTests(LogoutRecoveryFixture):

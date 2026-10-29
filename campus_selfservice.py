@@ -6,7 +6,7 @@ No request, cookie, password, device identifier or response body is logged here.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie, CookieError
@@ -17,7 +17,7 @@ import math
 import re
 import time
 import threading
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit, parse_qsl
 
 import campus_core as core
 import campus_protocol as protocol
@@ -33,6 +33,10 @@ DISCONNECT = '/Self/dashboard/tooffline'
 WEB_LOGOUT = '/Self/login/logout'
 MAX_BODY = 2 * 1024 * 1024
 MAX_DEVICES = 128
+NAS_BINDING_TTL = 10.0
+NAS_PROBES = ('http://9.9.9.9/', 'http://1.1.1.1/')
+NAS_PORTAL_HOSTS = frozenset(('10.2.5.251',))
+_NAS_PROOF_ISSUER = object()
 
 
 class SelfServiceError(RuntimeError):
@@ -57,6 +61,171 @@ class NoMatchingDevice(SelfServiceError):
 
 class AmbiguousDevice(SelfServiceError):
     pass
+
+
+def _network_context(wifi):
+    return (wifi.ssid, wifi.guid, wifi.index, _ip(wifi.ip), _mac(wifi.mac), str(wifi.gateway or ''))
+
+
+def _nas_context_guard(wifi, reader):
+    current = reader()
+    core.guard(wifi, current, wifi.ssid.casefold() == core.TEC.casefold())
+    if _network_context(current) != _network_context(wifi):
+        raise UnsupportedService('无线设备或接入参数已改变，未使用旧的设备证明。')
+    return current
+
+
+def _nas_target_matches(target, wifi):
+    """Validate original router parameters; never fill or rewrite missing values."""
+    if (not isinstance(target, str) or len(target) > 8192
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in target)):
+        return False
+    try:
+        parts = urlsplit(target)
+        if (parts.scheme not in ('http', 'https') or parts.hostname not in NAS_PORTAL_HOSTS
+                or parts.port not in (None, 80, 443, 801, 802)
+                or parts.username or parts.password or parts.fragment):
+            return False
+        fields = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True,
+                           encoding='utf-8', errors='strict', max_num_fields=128)
+        critical = {'wlanuserip', 'mac', 'wlanacname', 'nasip'}
+        values = {}
+        for key, value in fields:
+            key = key.casefold()
+            if key not in critical:
+                continue
+            if key in values or '%' in value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+                return False
+            values[key] = value
+        if set(values) != critical:
+            return False
+        nas = _ip(values['nasip'])
+        if (not nas or nas == '255.255.255.255' or ipaddress.IPv4Address(nas).is_loopback
+                or ipaddress.IPv4Address(nas).is_link_local):
+            return False
+        return (bool(_ip(wifi.ip)) and bool(_mac(wifi.mac))
+                and _ip(values['wlanuserip']) == _ip(wifi.ip)
+                and _mac(values['mac']) == _mac(wifi.mac)
+                and 0 < len(values['wlanacname'].strip()) <= 256)
+    except (ValueError, UnicodeError):
+        return False
+
+
+class _NasScripts(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.blocks, self.current, self.invalid = [], None, False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'script':
+            attrs = dict(attrs)
+            if self.current is not None or attrs.get('src') or attrs.get('type', '').casefold() not in (
+                    '', 'text/javascript', 'application/javascript'):
+                self.invalid = True
+            self.current = []
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'script' and self.current is not None:
+            self.blocks.append(''.join(self.current))
+            self.current = None
+
+
+def _raw_nas_target(seed, status, location, text):
+    if status in (301, 302, 303, 307, 308) and isinstance(location, str) and location:
+        return urljoin(seed, location)
+    if status != 200 or location or not isinstance(text, str) or len(text) > MAX_BODY:
+        return ''
+    # Recognize literal location assignments/replacements only, without running JS
+    # or consulting a page URL synthesized by the portal-discovery machinery.
+    literal = r'''(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")'''
+    script = text
+    if '<' in text:
+        parser = _NasScripts()
+        parser.feed(text)
+        if parser.invalid or parser.current is not None or len(parser.blocks) != 1:
+            return ''
+        script = parser.blocks[0]
+    prefix = r'(?:(?:window|top|self)\.)?location'
+    match = re.fullmatch(r'\s*(?:' + prefix + r'(?:\.href)?\s*=\s*(' + literal + r')|'
+                         + prefix + r'\.replace\s*\(\s*(' + literal + r')\s*\))\s*;?\s*', script)
+    if match is None:
+        return ''
+    try:
+        return urljoin(seed, protocol._literal(next(value for value in match.groups() if value is not None)))
+    except protocol.UnsupportedPortal:
+        return ''
+
+
+def _fetch_raw_nas_redirect(url, wifi, reader, allow_tec):
+    parts = urlsplit(url)
+    reader()
+    conn = core.BoundHTTP(parts.hostname, 80, wifi)
+    try:
+        conn.request('GET', '/', headers={'User-Agent':'CampusLogin/1.0',
+            'Cache-Control':'no-cache', 'Connection':'close', 'Accept-Encoding':'identity'})
+        response = conn.getresponse()
+        raw = response.read(MAX_BODY + 1)
+        if len(raw) > MAX_BODY:
+            raise UnsupportedService('接入设备返回内容过大，未确认设备绑定。')
+        location = response.getheader('Location', '')
+        raw, headers = core.decode_http_body(raw, response.getheaders())
+        text = core.decode_text(raw, headers)
+        reader()
+        return response.status, location, text
+    finally:
+        conn.close()
+
+
+@dataclass(frozen=True, repr=False)
+class NasBinding:
+    portal_url: str
+    context: tuple
+    observed_at: float
+    _issuer: object = field(default=None, init=False, repr=False)
+
+    def validate(self, wifi, reader=None, clock=None):
+        reader = core.read_wifi if reader is None else reader
+        clock = time.monotonic if clock is None else clock
+        if (self._issuer is not _NAS_PROOF_ISSUER or self.context != _network_context(wifi)
+                or not 0 <= clock() - self.observed_at <= NAS_BINDING_TTL
+                or not _nas_target_matches(self.portal_url, wifi)):
+            raise UnsupportedService('接入设备绑定证明已失效，未执行下线。')
+        _nas_context_guard(wifi, reader)
+        if not 0 <= clock() - self.observed_at <= NAS_BINDING_TTL:
+            raise UnsupportedService('接入设备绑定证明已过期，未执行下线。')
+        return True
+
+
+def observe_nas_binding(wifi, reader=None, getter=None, clock=None):
+    """Observe one bound NAS redirect, without authentication or URL rewriting."""
+    reader = core.read_wifi if reader is None else reader
+    getter = _fetch_raw_nas_redirect if getter is None else getter
+    clock = time.monotonic if clock is None else clock
+    if not wifi.ready or not _mac(wifi.mac):
+        raise UnsupportedService('当前无线设备信息不完整，未确认接入绑定。')
+    guarded = lambda:_nas_context_guard(wifi, reader)
+    with core.trace_scope(None):
+        guarded()
+        for seed in NAS_PROBES:
+            observed_at = clock()
+            try:
+                status, location, text = getter(seed, wifi, reader=guarded,
+                    allow_tec=wifi.ssid.casefold() == core.TEC.casefold())
+            except (OSError, http.client.HTTPException):
+                guarded()
+                continue
+            guarded()
+            target = _raw_nas_target(seed, status, location, text)
+            if _nas_target_matches(target, wifi):
+                proof = NasBinding(target, _network_context(wifi), observed_at)
+                object.__setattr__(proof, '_issuer', _NAS_PROOF_ISSUER)
+                proof.validate(wifi, reader=reader, clock=clock)
+                return proof
+    raise UnsupportedService('接入设备未提供完整的本机绑定证明，未自动下线。')
 
 
 def _serialized(method):
@@ -270,17 +439,23 @@ def parse_login_form(text, session_cookie=None):
 
 class SelfServiceClient:
     def __init__(self, wifi, reader=None, trace=None, connection_factory=None,
-                 cleanup_reader=None, sleeper=None):
+                 cleanup_reader=None, sleeper=None, nas_getter=None, clock=None):
         self.wifi = wifi
         self.reader = core.read_wifi if reader is None else reader
         self.cleanup_reader = self.reader if cleanup_reader is None else cleanup_reader
         self.connection_factory = core.BoundHTTP if connection_factory is None else connection_factory
         self.trace = trace
         self._sleep = time.sleep if sleeper is None else sleeper
+        self._clock = time.monotonic if clock is None else clock
+        self._nas_getter = nas_getter
         self._operation_lock = threading.RLock()
         self._submission_lock = threading.Lock()
         self._key = wifi.key
         self._mac = _mac(wifi.mac)
+        self._context = _network_context(wifi)
+        self._owner_id = None
+        self._nas_binding = None
+        self._pending_nas_binding = None
         self._cookies = {}
         self._authenticated = False
         self._closed = False
@@ -301,12 +476,14 @@ class SelfServiceClient:
             self.trace(event, **fields)
 
     def _guard(self, cleanup=False):
-        if self._closed or self.wifi.key != self._key or not self._mac:
+        if (self._closed or self.wifi.key != self._key or not self._mac
+                or _network_context(self.wifi) != self._context):
             raise SelfServiceError('自助服务操作上下文已失效。')
         current = (self.cleanup_reader if cleanup else self.reader)()
         core.guard(self.wifi, current, self.wifi.ssid.casefold() == core.TEC.casefold())
-        if _mac(current.mac) != self._mac:
-            raise SelfServiceError('无线设备地址已改变，自助服务操作已停止。')
+        if _network_context(current) != self._context:
+            raise SelfServiceError('无线设备或网关参数已改变，自助服务操作已停止。')
+        return current
 
     @staticmethod
     def _url(path):
@@ -361,18 +538,27 @@ class SelfServiceClient:
             headers.update({'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
                             'Origin':ORIGIN})
             body = urlencode(fields).encode('utf-8')
-        if p.path == DISCONNECT:
-            with self._submission_lock:
-                if (self._disconnect_attempted or not self._pending_session
-                        or not isinstance(params, dict)
-                        or params.get('sessionid') != self._pending_session):
-                    raise SelfServiceError('自助下线已经提交或会话已改变，未重复发送。')
-                self._disconnect_attempted = True
-                self._summary['disconnect_requests'] = 1
-            self._record('selfservice.disconnect_submitted', requests=1)
         conn = self.connection_factory('202.119.196.6', 8080, self.wifi)
         started = time.monotonic()
         try:
+            if p.path == DISCONNECT:
+                # Finish TCP setup before the last short-lived proof check; an
+                # address-only device must not be authorized by a stale proof
+                # while a slow connection is still being established.
+                connect = getattr(conn, 'connect', None)
+                if callable(connect):
+                    connect()
+                self._guard(cleanup)
+                if self._pending_nas_binding is not None:
+                    self._pending_nas_binding.validate(self.wifi, reader=self.reader, clock=self._clock)
+                with self._submission_lock:
+                    if (self._disconnect_attempted or not self._pending_session
+                            or not isinstance(params, dict)
+                            or params.get('sessionid') != self._pending_session):
+                        raise SelfServiceError('自助下线已经提交或会话已改变，未重复发送。')
+                    self._disconnect_attempted = True
+                    self._summary['disconnect_requests'] = 1
+                self._record('selfservice.disconnect_submitted', requests=1)
             conn.request(method, target, body=body, headers=headers)
             response = conn.getresponse()
             raw = response.read(MAX_BODY + 1)
@@ -472,22 +658,56 @@ class SelfServiceClient:
         if status != 200:
             raise UnsupportedService('自助服务设备列表暂不可读取，未继续下线。')
         devices = parse_online_devices(text)
+        owners = {d.user_id for d in devices}
+        if owners:
+            owner = next(iter(owners))
+            if self._owner_id is not None and owner != self._owner_id:
+                raise AuthenticationError('自助服务设备归属已改变，未继续操作。')
+            self._owner_id = owner
         self._summary['device_queries'] += 1
         self._record('selfservice.device_list_read', count=len(devices))
         return devices
 
     @_serialized
+    def select_current_session(self, devices, session_info=None):
+        if not self._authenticated:
+            raise AuthenticationError('自助服务尚未登录，未选择设备。')
+        self._guard()
+        if (not isinstance(devices, list) or not all(isinstance(d, DeviceSession) for d in devices)
+                or len({d.session_id for d in devices}) != len(devices)
+                or len({d.user_id for d in devices}) > 1
+                or devices and {d.user_id for d in devices} != {self._owner_id}):
+            raise UnsupportedService('自助服务设备归属或会话列表无法确认，未选择设备。')
+        try:
+            return select_current_session(devices, self.wifi, session_info)
+        except NoMatchingDevice:
+            candidates = [d for d in devices if d.ip == _ip(self.wifi.ip)]
+            if len(candidates) > 1:
+                raise AmbiguousDevice('本机地址对应多个会话，未自动下线。') from None
+            if len(candidates) != 1 or candidates[0].mac:
+                raise
+            if self._nas_binding is None:
+                self._nas_binding = observe_nas_binding(self.wifi, reader=self.reader,
+                    getter=self._nas_getter, clock=self._clock)
+            self._nas_binding.validate(self.wifi, reader=self.reader, clock=self._clock)
+            self._record('selfservice.binding_verified', proof_type='nas_current_ip', verified=True)
+            return candidates[0]
+
+    @_serialized
     def disconnect_current(self, session_info=None, before_disconnect=None):
         if self._disconnect_attempted:
             raise SelfServiceError('本次自助下线已经提交过，未重复发送。')
-        selected = select_current_session(self.list_online_devices(), self.wifi, session_info)
+        selected = self.select_current_session(self.list_online_devices(), session_info)
         # Do not send an identifier that disappeared or changed while preparing.
-        verified = select_current_session(self.list_online_devices(), self.wifi, session_info)
+        verified = self.select_current_session(self.list_online_devices(), session_info)
         if selected != verified:
             raise AmbiguousDevice('自助服务会话已变化，未发送过期下线请求。')
         if before_disconnect is not None:
             before_disconnect()
         self._guard()
+        if not selected.mac:
+            self._nas_binding.validate(self.wifi, reader=self.reader, clock=self._clock)
+            self._pending_nas_binding = self._nas_binding
         self._pending_session = selected.session_id
         try:
             status, location, body = self._request(DISCONNECT,
@@ -500,9 +720,11 @@ class SelfServiceClient:
                     self._summary['request_accepted'] = data['success']
         except (OSError, http.client.HTTPException, SelfServiceError):
             # A timeout may follow a received request. Only read back; never retry.
-            pass
+            if not self._disconnect_attempted:
+                raise
         finally:
             self._pending_session = None
+            self._pending_nas_binding = None
         absent_samples, seen_absent = 0, False
         for delay in (0, 1, 2, 3):  # elapsed 0/1/3/6 seconds, reads only
             try:
@@ -511,7 +733,8 @@ class SelfServiceClient:
                     self._sleep(delay)
                 remaining = self.list_online_devices()
                 removed = not any(d.session_id == selected.session_id for d in remaining)
-                same_mac = [d for d in remaining if d.mac == self._mac]
+                same_mac = [d for d in remaining if d.mac == self._mac
+                            or not selected.mac and d.ip == _ip(self.wifi.ip)]
                 self._summary['session_removed'] = removed
                 if same_mac:
                     if seen_absent or removed:
