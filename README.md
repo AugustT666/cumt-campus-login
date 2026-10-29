@@ -6,7 +6,7 @@
 
 用于中国矿业大学校园 WiFi 的 Windows 登录工具，支持保存多个账号、登录、注销和连接后自动弹出。
 
-**当前版本：v1.7.8，约 10.88 MB。**
+**当前版本：v1.7.8，约 10.89 MB。**
 
 [下载 Windows 版](https://github.com/AugustT666/cumt-campus-login/releases/tag/v1.7.8) · [更新记录](CHANGELOG.md)
 
