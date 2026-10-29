@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 from urllib.parse import urlsplit, parse_qs
@@ -378,8 +379,21 @@ class ClientTests(unittest.TestCase):
         self.helper.run_authentication.assert_called_once()
         self.assertEqual(self.helper.run_authentication.call_args.args[:6],(TEC,'fake-teacher','fake-password','','login',True))
     def test_logout_requires_current_campus_network(self):
-        with patch.object(c,'read_wifi',return_value=HOTSPOT):result=self.helper.logout()
-        self.assertFalse(result['ok'])
+        self.helper.run_authentication=MagicMock()
+        self.helper.session_engine=MagicMock()
+        with patch.object(c,'read_wifi',return_value=HOTSPOT), \
+                patch.object(a.selfservice,'Client') as service, \
+                patch.object(socket.socket,'connect',side_effect=AssertionError('No campus request in this test')):
+            result=self.helper.logout()
+            self.assertTrue(result['ok'])
+            deadline=time.monotonic()+3
+            while self.helper.busy and time.monotonic()<deadline:
+                __import__('threading').Event().wait(.005)
+            self.assertFalse(self.helper.busy)
+            self.helper.session_engine.assert_not_called()
+            self.helper.run_authentication.assert_not_called()
+            service.assert_not_called()
+        self.assertIn('请先连接',self.helper.status)
 
 class BrowserTests(unittest.TestCase):
     @classmethod

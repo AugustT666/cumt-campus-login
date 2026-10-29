@@ -51,6 +51,7 @@ def main():
         assert page.locator('#login-button').inner_text()=='登录'
         assert page.locator('#logout-button').inner_text()=='注销'
         assert page.locator('#logout-button').is_disabled()
+        assert page.locator('#cancel-operation').is_hidden()
         assert page.locator('#status-refresh').count()==1
         assert page.locator('#diagnostic-export').inner_text()=='导出诊断包'
         assert page.locator('#account').count()==1
@@ -71,6 +72,7 @@ def main():
           api={boot:async()=>window.fakeData,get_state:async()=>window.fakeState,
             login:async(...args)=>{window.fakeLog.push(['login',...args]);return {ok:true}},
             logout:async()=>{window.fakeLog.push(['logout']);return {ok:true}},
+            cancel_operation:async()=>{window.fakeLog.push(['cancel_operation']);window.fakeState.status='已请求停止';return {ok:true,message:'已请求停止'}},
             refresh_status:async()=>{window.fakeLog.push(['refresh_status']);return {ok:true}},
             diagnostic:async()=>{window.fakeLog.push(['diagnostic']);return window.fakeDiagnostic},
             select_profile:async(id)=>{window.fakeData.selected=id;window.fakeData.account=id==='two'?'fake-second':id?'fake-account':'';window.fakeData.password=id?'fake-password':'';return {ok:true,data:window.fakeData}},
@@ -229,7 +231,30 @@ def main():
         assert page.locator('#profiles').is_disabled()
         page.evaluate("window.fakeState.operation='logout';refresh()")
         assert page.locator('#logout-button').inner_text()=='正在注销…'
+        assert page.locator('#cancel-operation').is_visible()
+        assert page.locator('#cancel-operation').is_enabled()
+        # Cancellation must remain available while an operation or profile
+        # bridge call is pending; only the cancellation request is deduplicated.
+        page.evaluate("() => {actionBusy=true;profileBusy=true;window.savedCancel=api.cancel_operation;api.cancel_operation=()=>{window.fakeLog.push(['cancel_requested']);return new Promise(resolve=>{window.releaseCancel=async()=>resolve(await window.savedCancel())})};updateControls()}")
+        assert page.locator('#cancel-operation').is_enabled()
+        assert page.locator('#login-button').is_disabled()
+        assert page.locator('#logout-button').is_disabled()
+        assert page.evaluate('document.documentElement.scrollWidth<=window.innerWidth')
+        assert page.evaluate('document.documentElement.scrollHeight<=window.innerHeight')
+        page.locator('#cancel-operation').click()
+        assert page.locator('#cancel-operation').inner_text()=='正在停止…'
+        assert page.locator('#cancel-operation').is_disabled()
+        page.evaluate('cancelOperation();cancelOperation()')
+        assert page.evaluate("window.fakeLog.filter(x=>x[0]==='cancel_requested').length")==1
+        assert not page.evaluate("window.fakeLog.some(x=>x[0]==='cancel_operation')")
+        page.evaluate('() => {window.releaseCancel();}')
+        page.wait_for_function("!cancelBusy&&window.fakeLog.filter(x=>x[0]==='cancel_operation').length===1")
+        assert page.locator('#toast').inner_text()=='已请求停止'
+        assert page.evaluate('state.busy'), 'Requesting cancellation must not pretend the job already stopped'
+        assert page.locator('#cancel-operation').is_enabled()
+        page.evaluate("() => {api.cancel_operation=window.savedCancel;actionBusy=false;profileBusy=false;document.getElementById('toast').style.display='none';updateControls()}")
         page.evaluate("window.fakeState.busy=false;window.fakeState.operation='';window.fakeState.logged_in=false;window.fakeState.session_state='unknown';refresh()")
+        assert page.locator('#cancel-operation').is_hidden()
         assert page.locator('#logout-button').is_enabled()
         assert page.locator('#online-account').inner_text()=='在线账号：尚未确认'
         page.evaluate("window.fakeState.session_state='offline';refresh()")
@@ -285,6 +310,8 @@ def main():
         result['boot_error']=window.evaluate_js('window.clientBootError||null')
         result['startup_switch']=window.evaluate_js("document.getElementById('startup').getAttribute('role')")
         result['logout_button']=window.evaluate_js("document.getElementById('logout-button').innerText")
+        result['cancel_operation_api']=window.evaluate_js('typeof window.pywebview.api.cancel_operation')
+        result['cancel_operation_button']=window.evaluate_js("document.getElementById('cancel-operation').innerText")
         result['status_refresh']=window.evaluate_js("!!document.getElementById('status-refresh')")
         result['diagnostic_export']=window.evaluate_js("document.getElementById('diagnostic-export').innerText")
         result['online_identity']=window.evaluate_js("document.getElementById('online-account').innerText")
@@ -296,11 +323,13 @@ def main():
     assert result['title']==a.TITLE and result['method']=='function' and result['logo_loaded'],result
     assert result['ssid']==helper.wifi.ssid and result['startup_switch']=='switch',result
     assert result['logout_button']=='注销' and result['status_refresh'],result
+    assert result['cancel_operation_api']=='function' and result['cancel_operation_button']=='取消操作',result
     assert result['diagnostic_export']=='导出诊断包' and result['logging_isolated'],result
     assert result['online_identity']=='在线账号：尚未确认',result
     report={'version':c.VERSION,'compact_ui':True,'no_conversation_copy':True,'webview_result':result,
             'separate_logout':True,'online_login_does_not_logout':True,'manual_status_refresh':True,
             'session_state_controls':True,'diagnostic_export_feedback':True,'logging_failure_visible':True,
+            'cancellation_available_while_busy':True,'cancellation_request_deduplicated':True,
             'server_identity_separate_from_selected_profile':True,'server_identity_text_only':True,
             'unknown_offline_disconnect_clear_identity':True,'account_switch_requires_logout_notice':True,
             'concise_help_fits_without_scrolling':True,'advanced_address_settings_collapsible':True,

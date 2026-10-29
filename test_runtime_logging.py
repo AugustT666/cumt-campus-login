@@ -162,9 +162,13 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(manifest['sessions']), 2)
 
     def test_app_registered_credential_encodings_never_leak_to_disk_or_zip(self):
-        # Invalid network selection registers the typed credentials through App,
-        # while stopping before any persistence or authentication request.
-        self.assertFalse(self.client.login(ACCOUNT, PASSWORD, 'invalid-selection')['ok'])
+        # The bridge accepts promptly; the worker registers secrets and rejects
+        # invalid selection before any persistence or authentication request.
+        with patch.object(self.client,'run_authentication') as authenticate, \
+                patch.object(self.client,'save_profile') as save:
+            self.execute(lambda:self.client.login(ACCOUNT, PASSWORD, 'invalid-selection'))
+            authenticate.assert_not_called()
+            save.assert_not_called()
         variants = set()
         for secret in (ACCOUNT, PASSWORD):
             variants.update((secret, html.escape(secret, quote=True), quote(secret, safe=''),

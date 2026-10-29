@@ -42,6 +42,8 @@ class SessionTests(unittest.TestCase):
         self.enterContext(patch.object(core,'internet_check',return_value={'online':False,'checks':[]}))
         self.service_client=self.enterContext(patch.object(selfservice,'Client',
             side_effect=AssertionError('No live self-service in session tests')))
+        self.nas_observer=self.enterContext(patch.object(selfservice,'observe_nas_binding',
+            side_effect=selfservice.UnsupportedService('Fictional NAS proof unavailable')))
         self.enterContext(patch.object(socket.socket,'connect',
             side_effect=AssertionError('No live sockets in session tests')))
     def tearDown(self):

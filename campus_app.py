@@ -33,7 +33,7 @@ LOGOUT_ROUTE_TTL = 300.0
 LOGOUT_AUTO_HOLD = 60.0
 LOGOUT_CONFIRM_TIMEOUT = 20.0
 LOGOUT_STABLE_SECONDS = 5.0
-LOGOUT_SESSION_LOOKUP_TIMEOUT = 45.0
+LOGOUT_SESSION_LOOKUP_TIMEOUT = 3.0
 LOGOUT_PORTAL_STABLE_SECONDS = 0.5
 LOGOUT_PORTAL_SETTLE_SECONDS = 2.0
 LOGOUT_BACKGROUND_SECONDS = 65.0
@@ -101,6 +101,7 @@ class Bridge:
     def select_profile(self, profile_id): return self._app.select_profile(profile_id)
     def delete_profile(self, profile_id): return self._app.delete_profile(profile_id)
     def logout(self): return self._app.logout()
+    def cancel_operation(self): return self._app.cancel_operation()
     def trust_portal(self): return self._app.trust_portal()
     def save_hint(self, hint): return self._app.save_hint(hint)
     def diagnostic(self): return self._app.diagnostic()
@@ -166,6 +167,9 @@ class App:
         self.closed=threading.Event()
         self.cancel=threading.Event()
         self.lock=threading.RLock()
+        self._profile_io_lock=threading.RLock()
+        self._ui_logging_error=''
+        self._ui_state_cache=None
         self.busy=False
         self.operation=''
         self.auto_job=False
@@ -222,6 +226,7 @@ class App:
             self.status=str(text)
             self.messages.append({'time':dt.datetime.now().strftime('%H:%M:%S'),'text':str(text)})
             self.messages=self.messages[-60:]
+            self._cache_ui_state_locked()
         self.record('app.message',text=str(text))
 
     def login_failure_message(self, text, wifi=None):
@@ -251,47 +256,75 @@ class App:
                 'settings_warning':getattr(self.store,'settings_warning','')
                     if isinstance(getattr(self.store,'settings_warning',''),str) else ''}
 
-    def save_profile(self,profile_id,account,password,operator):
+    def save_profile(self,profile_id,account,password,operator,_during_login=False):
         self.register_secrets(str(account),str(password))
         self.record('profiles.save_requested',profile_id=str(profile_id),operator=operator)
         with self.lock:
-            if self.busy: return {'ok':False,'message':'正在登录，请稍后修改账号。'}
+            if self.busy and not (_during_login and self.operation=='login'):
+                return {'ok':False,'message':'正在登录，请稍后修改账号。'}
             if not str(account).strip() or not str(password): return {'ok':False,'message':'请输入账号和密码。'}
             if operator not in ('','telecom','unicom','cmcc','campus'):
                 return {'ok':False,'message':'请选择有效的登录网络。'}
-            try:
+        try:
+            with getattr(self,'_profile_io_lock',self.lock):
                 self.store.save_profile(str(profile_id),str(account).strip(),str(password),operator)
                 return {'ok':True,'data':self.boot()}
-            except (OSError,RuntimeError) as exc:
-                self.record_exception('profiles.save_error',exc)
-                return {'ok':False,'message':str(exc)}
+        except (OSError,RuntimeError) as exc:
+            self.record_exception('profiles.save_error',exc)
+            return {'ok':False,'message':str(exc)}
 
     def select_profile(self,profile_id):
         self.record('profiles.select_requested',profile_id=str(profile_id))
         with self.lock:
             if self.busy: return {'ok':False,'message':'正在登录，请稍后切换账号。'}
-            try:
+        try:
+            with getattr(self,'_profile_io_lock',self.lock):
                 self.store.select_profile(str(profile_id))
                 return {'ok':True,'data':self.boot()}
-            except (OSError,RuntimeError) as exc:
-                self.record_exception('profiles.select_error',exc)
-                return {'ok':False,'message':str(exc)}
+        except (OSError,RuntimeError) as exc:
+            self.record_exception('profiles.select_error',exc)
+            return {'ok':False,'message':str(exc)}
 
     def delete_profile(self,profile_id):
         self.record('profiles.delete_requested',profile_id=str(profile_id))
         with self.lock:
             if self.busy: return {'ok':False,'message':'正在登录，请稍后修改账号。'}
-            try:
+        try:
+            with getattr(self,'_profile_io_lock',self.lock):
                 self.store.delete_profile(str(profile_id))
                 return {'ok':True,'data':self.boot()}
-            except (OSError,RuntimeError) as exc:
-                self.record_exception('profiles.delete_error',exc)
-                return {'ok':False,'message':str(exc)}
+        except (OSError,RuntimeError) as exc:
+            self.record_exception('profiles.delete_error',exc)
+            return {'ok':False,'message':str(exc)}
 
     def get_state(self):
-        with self.lock:
-            log=getattr(self,'runtime_log',None)
-            return {'version':core.VERSION,'ssid':self.wifi.ssid,'ip':self.wifi.ip,'campus':self.wifi.campus,
+        # The UI must never wait behind WLAN, profile or logging I/O. A retained
+        # immutable snapshot is preferable to freezing every polling API call.
+        log=getattr(self,'runtime_log',None)
+        log_lock=getattr(log,'_lock',None)
+        if log_lock is not None and log_lock.acquire(blocking=False):
+            try:
+                self._ui_logging_error=str(log.write_error) or getattr(log,'location_warning','')
+            finally:
+                log_lock.release()
+        if not self.lock.acquire(blocking=False):
+            cached=getattr(self,'_ui_state_cache',None)
+            return dict(cached) if cached is not None else self._ui_state_fields()
+        try:
+            return dict(self._cache_ui_state_locked())
+        finally:
+            self.lock.release()
+
+    def _cache_ui_state_locked(self):
+        try:
+            self._ui_state_cache=self._ui_state_fields()
+        except AttributeError:
+            # Partial objects used by isolated host tests have no UI state.
+            pass
+        return getattr(self,'_ui_state_cache',None) or {}
+
+    def _ui_state_fields(self):
+        return {'version':core.VERSION,'ssid':self.wifi.ssid,'ip':self.wifi.ip,'campus':self.wifi.campus,
                     'student':self.wifi.student,'busy':self.busy,'operation':self.operation,
                     'logged_in':self.logged_in,'status':self.status,'pending_host':self.pending_host,
                     'session_state':getattr(self,'session_state','unknown'),
@@ -305,7 +338,7 @@ class App:
                     'last_job_elapsed_ms':getattr(self,'last_job_elapsed_ms',0),
                     'quiet_hours_active':bool(self.settings.get('quiet_hours',True) is True
                                               and student_auth_time_notice(self.wifi)),
-                    'logging_error':(str(log.write_error) or getattr(log,'location_warning','')) if log is not None else ''}
+                    'logging_error':getattr(self,'_ui_logging_error','')}
 
     @staticmethod
     def _portal_network_context(wifi):
@@ -420,37 +453,68 @@ class App:
             self._engine=engine
         return engine
 
-    def apply_session(self,wifi,report,announce=False):
-        core.guard(wifi,core.read_wifi(),wifi.ssid.casefold()==core.TEC.casefold())
+    def _verify_current_nas_portal(self,wifi,check_allowed):
+        """Use a fresh NAS client tuple when shared status has no device identity."""
+        token=self._observe_portal_network(wifi)
+        proof=selfservice.observe_nas_binding(wifi,reader=check_allowed)
+        if not isinstance(proof,selfservice.NasBinding):
+            raise selfservice.UnsupportedService('学校接入设备证明无法确认，未提交认证。')
+        proof.validate(wifi,reader=check_allowed)
+        portal=core.fresh_url(proof.portal_url,wifi)
         with self.lock:
-            if self.closed.is_set() or self.cancel.is_set(): raise RuntimeError('本次操作已停止。')
-            state=report.get('state','unknown')
-            self.session_state=state if state in ('online','offline') else 'unknown'
-            self.logged_in=self.session_state=='online'
-            self.online_account=str(report.get('online_account','')) if self.logged_in else ''
-            self.identity_source='server' if self.online_account else ''
-            self.register_secrets(self.online_account)
-            self.auth_key=wifi.key if self.logged_in else None
-            self.session_checked_key=wifi.key
-            self.session_checked_monotonic=time.monotonic()
-            self.session_checked_at=dt.datetime.now().strftime('%H:%M:%S')
-            self.session_diagnostic=dict(report)
-            self.record('session.result',wifi=core.asdict(wifi),result=report)
-            if self.session_state=='offline' and self._logout_auto_suppressed(wifi):
-                self._logout_watch['saw_offline']=True
-            if announce:
-                if self.session_state=='online' and self._logout_auto_suppressed(wifi):
-                    self._logout_recovery_needed=True
-                    reappeared=self._logout_watch.get('saw_offline',False)
-                    self.logout_diagnostic['outcome']='session_reappeared' if reappeared else 'still_online'
-                    self.record('logout.session_reappeared',elapsed_ms=round(
-                        (time.monotonic()-self._logout_watch['started'])*1000))
-                    self.message(('注销后服务器再次报告本机在线' if reappeared else '注销仍未确认，服务器继续报告本机在线')
-                                 +'，本程序未重新登录；请从“自助服务”核对本机会话。')
-                    return
-                self.message({'online':'当前无线网已登录，可直接注销',
-                              'offline':'当前无线网未登录',
-                              'unknown':self.status_failure_message(report,'暂时无法确认登录状态，请先刷新。')}[self.session_state])
+            self._assert_portal_route(wifi,token)
+            self.portal=portal
+            self.portal_key=wifi.key
+            self._portal_discovered=True
+            self._engine=None
+            self._verified_logout_route={'context':token,'portal':portal,
+                'checked_at':time.monotonic(),'hint_hash':hashlib.sha256(
+                    str(self.settings.get('portal_hint','')).encode('utf-8')).hexdigest()}
+        self.record('portal.nas_binding_verified',proof_type='fresh_nas_redirect',verified=True)
+        return proof
+
+    def _commit_session_locked(self,wifi,report,announce=False):
+        """Commit an already checked snapshot; never query Windows or log here."""
+        if self.closed.is_set() or self.cancel.is_set(): raise RuntimeError('本次操作已停止。')
+        state=report.get('state','unknown')
+        self.session_state=state if state in ('online','offline') else 'unknown'
+        self.logged_in=self.session_state=='online'
+        self.online_account=str(report.get('online_account','')) if self.logged_in else ''
+        self.identity_source='server' if self.online_account else ''
+        self.auth_key=wifi.key if self.logged_in else None
+        self.session_checked_key=wifi.key
+        self.session_checked_monotonic=time.monotonic()
+        self.session_checked_at=dt.datetime.now().strftime('%H:%M:%S')
+        self.session_diagnostic=dict(report)
+        if self.session_state=='offline' and self._logout_auto_suppressed(wifi):
+            self._logout_watch['saw_offline']=True
+        text=None
+        reappeared=False
+        if announce:
+            if self.session_state=='online' and self._logout_auto_suppressed(wifi):
+                self._logout_recovery_needed=True
+                reappeared=self._logout_watch.get('saw_offline',False)
+                self.logout_diagnostic['outcome']='session_reappeared' if reappeared else 'still_online'
+                text=(('注销后服务器再次报告本机在线' if reappeared else '注销仍未确认，服务器继续报告本机在线')
+                      +'，本程序未重新登录；请从“自助服务”核对本机会话。')
+            else:
+                text={'online':'当前无线网已登录，可直接注销',
+                      'offline':'当前无线网未登录',
+                      'unknown':self.status_failure_message(report,'暂时无法确认登录状态，请先刷新。')}[self.session_state]
+        self._cache_ui_state_locked()
+        return text,reappeared
+
+    def apply_session(self,wifi,report,announce=False):
+        current=core.read_wifi()
+        core.guard(wifi,current,wifi.ssid.casefold()==core.TEC.casefold())
+        self.register_secrets(str(report.get('online_account','')))
+        with self.lock:
+            if self._portal_network_context(current)!=self._portal_network_context(wifi):
+                raise RuntimeError('无线设备参数已改变，未应用旧会话状态。')
+            text,reappeared=self._commit_session_locked(wifi,report,announce)
+        self.record('session.result',wifi=core.asdict(wifi),result=report)
+        if reappeared:self.record('logout.session_reappeared')
+        if text is not None:self.message(text)
 
     @staticmethod
     def session_binding_conflict(report):
@@ -536,7 +600,11 @@ class App:
         except protocol.UnsupportedPortal as exc:
             self.record_exception('authentication.browser_fallback',exc,operation=operation)
             # A fallback is allowed only before any authentication request.
-            result=self.authenticate(wifi,account,password,operator,operation,tec)
+            self._browser_auth_guard=check_allowed
+            try:
+                result=self.authenticate(wifi,account,password,operator,operation,tec)
+            finally:
+                self._browser_auth_guard=None
             self.auth_diagnostic['backend']='browser'
             self.record('authentication.result',diagnostic=self.auth_diagnostic)
             return result
@@ -709,7 +777,9 @@ class App:
         return wifi,is_tec
 
     def start_job(self,kind,job,automatic=False):
-        with self.lock:
+        if not self.lock.acquire(blocking=False):
+            return {'ok':False,'message':'正在更新状态，请稍后重试。'}
+        try:
             if self.closed.is_set(): return {'ok':False,'message':'程序已退出。'}
             if self.busy:
                 return {'ok':False,'message':'正在处理，请稍候。'}
@@ -723,10 +793,13 @@ class App:
             self.cancel.clear()
             self.operation_id=uuid.uuid4().hex[:12]
             operation_id=self.operation_id
-            self.record('operation.accepted',operation_id=operation_id,kind=kind,automatic=automatic)
+            self._cache_ui_state_locked()
+        finally:
+            self.lock.release()
         def run():
             began=time.perf_counter()
             try:
+                self.record('operation.accepted',operation_id=operation_id,kind=kind,automatic=automatic)
                 self.record('operation.started',operation_id=operation_id,kind=kind,wifi=core.asdict(self.wifi))
                 with core.trace_scope(lambda event,level='DEBUG',**fields:self.record(event,level=level,operation_id=operation_id,**fields)):
                     job()
@@ -747,36 +820,52 @@ class App:
                     self.operation=''
                     self.auto_job=False
                     self.last_job_elapsed_ms=round((time.perf_counter()-began)*1000)
-                    self.record('operation.finished',operation_id=operation_id,kind=kind,
-                                cancelled=self.cancel.is_set(),elapsed_ms=self.last_job_elapsed_ms,
-                                state=getattr(self,'session_state','unknown'),status=self.status)
+                    fields={'cancelled':self.cancel.is_set(),'elapsed_ms':self.last_job_elapsed_ms,
+                            'state':getattr(self,'session_state','unknown'),'status':self.status}
+                    self._cache_ui_state_locked()
+                self.record('operation.finished',operation_id=operation_id,kind=kind,**fields)
         threading.Thread(target=run,daemon=True).start()
         return {'ok':True}
 
     def login(self,account,password,operator,profile_id='',automatic=False,expected=None,quiet_override=False):
-        with self.lock:
-            if self.closed.is_set(): return {'ok':False,'message':'程序已退出。'}
-            return self._login(account,password,operator,profile_id,automatic,expected,quiet_override)
+        return self._login(account,password,operator,profile_id,automatic,expected,quiet_override)
 
     def _login(self,account,password,operator,profile_id='',automatic=False,expected=None,quiet_override=False):
-        if not automatic:
-            self._stop_logout_verification()
-            self._logout_watch=None
-            self._logout_recovery_needed=False
-        self.register_secrets(str(account),str(password))
-        self.record('login.requested',operator=operator,automatic=automatic)
+        if not self.lock.acquire(blocking=False):
+            return {'ok':False,'message':'正在更新状态，请稍后重试。'}
+        try:
+            if self.closed.is_set(): return {'ok':False,'message':'程序已退出。'}
+            if automatic and not self.stu_automation_enabled():
+                return {'ok':False,'message':'自动登录已停止。'}
+            if automatic and expected is not None and not expected.campus:
+                return {'ok':False,'message':'自动认证仅允许校园网。'}
+            if not automatic:
+                self._stop_logout_verification()
+                self._logout_watch=None
+                self._logout_recovery_needed=False
+        finally:
+            self.lock.release()
         account=str(account).strip()
         password=str(password)
         if not account or not password:
             if self.logged_in:
-                return self.refresh_status()
+                def status_job():
+                    wifi,tec=self.permitted(logout=True)
+                    self.apply_session(wifi,self.session_engine(wifi,tec).status(),announce=True)
+                return self.start_job('status',status_job)
             return {'ok':False,'message':'请输入账号和密码。'}
-        try:
+        def job():
+            # Native WLAN, credential protection and profile I/O are worker work,
+            # not a synchronous bridge call or work under the UI state lock.
+            self.register_secrets(account,password)
+            self.record('login.requested',operator=operator,automatic=automatic)
             wifi,tec=self.permitted(logout=True)
+            if self.cancel.is_set() or self.closed.is_set():
+                raise RuntimeError('本次登录已停止。')
             if automatic and (not wifi.campus or not self.stu_automation_enabled()):
-                return {'ok':False,'message':'自动登录已停止。'}
+                raise RuntimeError('自动登录已停止。')
             if automatic and self._logout_auto_suppressed(wifi):
-                return {'ok':False,'message':'刚请求注销，已停止本次自动登录。'}
+                raise RuntimeError('刚请求注销，已停止本次自动登录。')
             if automatic:
                 try:
                     self._ensure_exclusive_auto()
@@ -785,25 +874,25 @@ class App:
                                           'phase':'coexistence_blocked','authentication_requests':0}
                     raise
             if expected: core.guard(expected,wifi,tec)
-        except RuntimeError as exc:
-            self.record_exception('login.rejected',exc)
-            return {'ok':False,'message':str(exc)}
-        if not tec and operator not in ('telecom','unicom','cmcc','campus'):
-            return {'ok':False,'message':'请选择登录网络。'}
-        effective_operator='' if tec else operator
-        with self.lock:
-            if self.busy: return {'ok':False,'message':'正在处理，请稍候。'}
+            if not tec and operator not in ('telecom','unicom','cmcc','campus'):
+                raise RuntimeError('请选择登录网络。')
+            effective_operator='' if tec else operator
             if not automatic:
-                saved=self.save_profile(profile_id,account,password,operator)
-                if not saved['ok']: return saved
-            if wifi.campus: self.auto_attempted=True
-        def check_allowed():
-            if self.cancel.is_set() or self.closed.is_set() or (automatic and not self.stu_automation_enabled()):
-                raise RuntimeError('本次登录已停止。')
-            if automatic:
-                self._ensure_exclusive_auto()
-            core.guard(wifi,core.read_wifi(),tec)
-        def job():
+                saved=self.save_profile(profile_id,account,password,operator,_during_login=True)
+                if not saved['ok']: raise RuntimeError(saved['message'])
+            with self.lock:
+                if wifi.campus:self.auto_attempted=True
+            nas_binding=[None]
+            def check_allowed():
+                if self.cancel.is_set() or self.closed.is_set() or (automatic and not self.stu_automation_enabled()):
+                    raise RuntimeError('本次登录已停止。')
+                if automatic:
+                    self._ensure_exclusive_auto()
+                current=core.read_wifi()
+                core.guard(wifi,current,tec)
+                if nas_binding[0] is not None:
+                    nas_binding[0].validate(wifi,reader=lambda:current)
+                return current
             check_allowed()
             self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'checking_status',
                                   'authentication_requests':0}
@@ -811,7 +900,8 @@ class App:
                 self.unconfirmed_connectivity={}
                 self.wifi=wifi
                 self.settings['operator']=operator
-                self.store.write_settings(self.settings)
+                settings=dict(self.settings)
+            self.store.write_settings(settings)
             self.message('正在检查登录状态…')
             report=self.session_engine(wifi,tec).status()
             self.apply_session(wifi,report)
@@ -822,11 +912,17 @@ class App:
                 return
             network_error=report.get('network_error') or {}
             if self.session_binding_conflict(report):
-                self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'session_conflict',
-                                      'authentication_requests':0}
-                self.record('authentication.preflight_blocked',diagnostic=self.auth_diagnostic)
-                self.message(self.status_failure_message(report,'本次未发送登录请求。'))
-                return
+                try:
+                    nas_binding[0]=self._verify_current_nas_portal(wifi,check_allowed)
+                except (selfservice.SelfServiceError,OSError,http.client.HTTPException) as exc:
+                    self.record_exception('authentication.nas_binding_unavailable',exc)
+                    self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'session_conflict',
+                                          'authentication_requests':0}
+                    self.record('authentication.preflight_blocked',diagnostic=self.auth_diagnostic)
+                    self.message(self.status_failure_message(report,'本次未发送登录请求。'))
+                    return
+                self.auth_diagnostic['nas_binding_verified']=True
+                self.record('authentication.conflict_resolved',proof_type='fresh_nas_redirect')
             if report.get('state')=='unknown' and network_error.get('code')=='permission_denied':
                 self.auth_diagnostic={'operation':'login','backend':'status_only','phase':'network_blocked',
                                       'authentication_requests':0,'network_error':dict(network_error)}
@@ -835,7 +931,7 @@ class App:
                         '本次未发送认证请求；请排查后刷新状态。')
                 self.message(self.login_failure_message(self.status_failure_message(report,detail),wifi))
                 return
-            if automatic and report.get('state')=='unknown':
+            if automatic and report.get('state')=='unknown' and not self.auth_diagnostic.get('nas_binding_verified'):
                 self.message(self.login_failure_message(self.status_failure_message(report,
                              '暂时无法确认登录状态，自动登录已停止；可刷新或手动登录'),wifi))
                 return
@@ -844,7 +940,10 @@ class App:
                 raise RuntimeError(notice)
             check_allowed()
             self.message('正在登录…')
-            result=self.run_authentication(wifi,account,password,effective_operator,'login',tec,check_allowed)
+            try:
+                result=self.run_authentication(wifi,account,password,effective_operator,'login',tec,check_allowed)
+            finally:
+                nas_binding[0]=None
             core.guard(wifi,core.read_wifi(),tec)
             if self.cancel.is_set() or self.closed.is_set(): raise RuntimeError('本次登录已停止。')
             if result is True:
@@ -931,6 +1030,13 @@ class App:
     def _logout_wait(self,seconds):
         self.cancel.wait(seconds)
 
+    def cancel_operation(self):
+        # A cancellation request must never wait for a state lock, native WLAN
+        # call, disk operation, or an in-flight HTTP request.
+        self.cancel.set()
+        self._stop_logout_verification()
+        return {'ok':True,'message':'已请求停止；已发送的请求可能仍在处理。'}
+
     def _stop_logout_verification(self):
         watch=getattr(self,'_logout_watch',None)
         if watch:
@@ -938,27 +1044,41 @@ class App:
             if watch.get('stop_event') is not None:
                 watch['stop_event'].set()
 
+    def _validate_logout_watch_locked(self,watch,current=None,recovery=False):
+        """Check in-memory intent and generation; no native or logging I/O."""
+        if (self._logout_watch is not watch or not watch.get('verifying')
+                or self.closed.is_set() or self.cancel.is_set()):
+            raise LogoutWatchStopped('本次注销复查已停止。')
+        if recovery:
+            if not self.busy or self.operation_id!=watch.get('recovery_operation_id'):
+                raise LogoutWatchStopped('本次注销兜底已被其他操作替代。')
+        elif self.busy:
+            raise LogoutWatchDeferred('正在优先处理前台操作。')
+        wifi=watch['wifi']
+        if current is not None and self._portal_network_context(current)!=self._portal_network_context(wifi):
+            raise LogoutWatchStopped('无线设备参数已改变，已停止旧注销复查。')
+        self._assert_portal_route(wifi,watch['route_token'])
+
     def _guard_logout_watch(self,watch,recovery=False):
-        def current_intent():
-            if (self._logout_watch is not watch or not watch.get('verifying')
-                    or self.closed.is_set() or self.cancel.is_set()):
-                raise LogoutWatchStopped('本次注销复查已停止。')
-            if recovery:
-                if not self.busy or self.operation_id!=watch.get('recovery_operation_id'):
-                    raise LogoutWatchStopped('本次注销兜底已被其他操作替代。')
-            elif self.busy:
-                raise LogoutWatchDeferred('正在优先处理前台操作。')
         with self.lock:
-            current_intent()
+            self._validate_logout_watch_locked(watch,recovery=recovery)
         wifi=watch['wifi']
         current=core.read_wifi()
         core.guard(wifi,current,wifi.ssid.casefold()==core.TEC.casefold())
         with self.lock:
-            current_intent()
-            if self._portal_network_context(current)!=self._portal_network_context(wifi):
-                raise LogoutWatchStopped('无线设备参数已改变，已停止旧注销复查。')
-            self._assert_portal_route(wifi,watch['route_token'])
+            self._validate_logout_watch_locked(watch,current,recovery)
         return current
+
+    def _message_logout_watch(self,watch,text,recovery=False):
+        log=getattr(self,'runtime_log',None)
+        clean=log.sanitize(str(text)) if log is not None else str(text)
+        with self.lock:
+            self._validate_logout_watch_locked(watch,recovery=recovery)
+            self.status=clean
+            self.messages.append({'time':dt.datetime.now().strftime('%H:%M:%S'),'text':clean})
+            self.messages=self.messages[-60:]
+            self._cache_ui_state_locked()
+        self.record('app.message',text=clean)
 
     def _start_logout_verification(self,wifi,report,route_token):
         with self.lock:
@@ -979,8 +1099,9 @@ class App:
         return watch['stop_event'].wait(seconds)
 
     def _claim_logout_recovery(self,watch,reason):
+        current=self._guard_logout_watch(watch)
         with self.lock:
-            self._guard_logout_watch(watch)
+            self._validate_logout_watch_locked(watch,current)
             if watch['fallback_started']:
                 return False
             watch['fallback_started']=True
@@ -990,13 +1111,17 @@ class App:
                         if self._logout_watch is not watch:
                             raise LogoutWatchStopped('已停止旧注销兜底。')
                         watch['recovery_operation_id']=self.operation_id
-                        self._guard_logout_watch(watch,recovery=True)
+                    fresh=self._guard_logout_watch(watch,recovery=True)
+                    with self.lock:
+                        self._validate_logout_watch_locked(watch,fresh,recovery=True)
                         self.auth_diagnostic=dict(watch['authentication'])
                         self.logout_diagnostic=watch['diagnostic']
                         self.auth_diagnostic['fallback_reason']=reason
                         self.logout_diagnostic['fallback_reason']=reason
                         self._logout_recovery_needed=True
-                        self.message('注销后连接仍在线，正在通过自助服务精准下线本机…')
+                        self._cache_ui_state_locked()
+                    self._message_logout_watch(watch,
+                        '注销后连接仍在线，正在通过自助服务精准下线本机…',recovery=True)
                     self._recover_logout(watch['wifi'],watch['report'],
                         lambda:self._guard_logout_watch(watch,recovery=True))
                 finally:
@@ -1014,8 +1139,6 @@ class App:
         wifi=watch['wifi']
         tec=wifi.ssid.casefold()==core.TEC.casefold()
         check=lambda:self._guard_logout_watch(watch)
-        # This engine is private to the read-only observer. A new login may use
-        # the App's cached engine while a slow probe is still returning.
         try:
             engine=protocol.Engine(wifi,watch['portal'],reader=check,allow_tec=tec)
             while time.monotonic()<watch['verify_until']:
@@ -1027,16 +1150,18 @@ class App:
                             time.monotonic()>=watch.get('next_access_check',watch['verify_until']-5)):
                         connectivity=core.internet_check(wifi,reader=check,allow_tec=tec)
                         report=engine.status()
+                    self.register_secrets(str(report.get('online_account','')))
+                    current=check()
+                    text=None
+                    reason=None
                     with self.lock:
-                        check()
-                        self.apply_session(wifi,report)
+                        self._validate_logout_watch_locked(watch,current)
+                        self._commit_session_locked(wifi,report)
                         self.logout_diagnostic['background_state']=report.get('state')
                         if connectivity is not None:
                             self.logout_diagnostic['portal_connectivity']=connectivity
                         if report.get('state')=='online' or connectivity and connectivity.get('online'):
                             reason='session_reappeared' if report.get('state')=='online' else 'access_still_online'
-                            if self._claim_logout_recovery(watch,reason):
-                                return
                         elif report.get('state')=='offline' and (watch['access_checked'] or connectivity is not None):
                             first_confirmation=not watch['access_checked']
                             announce=first_confirmation or self.logout_diagnostic.get('outcome')!='offline_confirmed'
@@ -1046,19 +1171,21 @@ class App:
                             self._logout_recovery_needed=False
                             self.logout_diagnostic['outcome']='offline_confirmed'
                             self.auth_diagnostic['phase']='offline_confirmed'
-                            if announce:self.message('已退出登录')
+                            if announce:text='已退出登录'
                         else:
                             self._logout_recovery_needed=True
                             self.logout_diagnostic['outcome']='unconfirmed'
-                            self.message('注销已提交，后台暂时无法确认状态；可刷新重试。')
+                            text='注销已提交，后台暂时无法确认状态；可刷新重试。'
+                        self._cache_ui_state_locked()
+                    self.record('session.result',wifi=core.asdict(wifi),result=report)
+                    if reason and self._claim_logout_recovery(watch,reason):return
+                    if text is not None:self._message_logout_watch(watch,text)
                 except LogoutWatchDeferred:
                     if self._logout_watch_wait(watch,0.2):break
                     continue
                 if self._logout_watch_wait(watch,min(LOGOUT_BACKGROUND_INTERVAL,
                     max(0.0,watch['verify_until']-time.monotonic()))):break
         except RuntimeError:
-            # A superseded intent or changed connection must not publish stale
-            # results, or initiate a fallback against a new campus session.
             pass
         except Exception as exc:
             self.record_exception('logout.background_error',exc)
@@ -1148,7 +1275,7 @@ class App:
             last=self.session_engine(wifi,wifi.ssid.casefold()==core.TEC.casefold()).status()
             self.apply_session(wifi,last)
             devices=client.list_online_devices()
-            absent=not any(d.mac==target_mac for d in devices)
+            absent=not any(d.mac==target_mac or d.ip==wifi.ip for d in devices)
             samples+=1
             now=time.monotonic()
             self.logout_diagnostic['verification']={'samples':samples,
@@ -1180,7 +1307,7 @@ class App:
                 check_allowed()
                 devices=client.list_online_devices()
                 try:
-                    selfservice.select_current_session(devices,wifi,report)
+                    client.select_current_session(devices,report)
                 except selfservice.NoMatchingDevice:
                     if any(d.mac==protocol._session_mac(wifi.mac) for d in devices):
                         raise selfservice.AmbiguousDevice('自助服务中的本机地址信息无法核对，未下线其他会话。')
@@ -1230,13 +1357,11 @@ class App:
             self.record('logout.recovery_completed',diagnostic=self.logout_diagnostic)
 
     def logout(self):
-        self.record('logout.requested')
-        try:
-            wifi,tec=self.permitted(logout=True)
-        except RuntimeError as exc:
-            self.record_exception('logout.rejected',exc)
-            return {'ok':False,'message':str(exc)}
         def job():
+            self.record('logout.requested')
+            wifi,tec=self.permitted(logout=True)
+            if self.cancel.is_set() or self.closed.is_set():
+                raise RuntimeError('本次注销已停止。')
             self.wifi=wifi
             self.auto_attempted=True
             self._stu_popup_pending=False
@@ -1250,6 +1375,7 @@ class App:
             self.auth_diagnostic={'operation':'logout','backend':'portal',
                 'phase':'preflight','authentication_requests':0}
             route_token=self._observe_portal_network(wifi)
+            nas_binding=[None]
             def check_allowed():
                 with self.lock:
                     if self._logout_watch is not intent_watch:
@@ -1259,6 +1385,8 @@ class App:
                     if self._logout_watch is not intent_watch:
                         raise LogoutWatchStopped('本次注销已被新的操作取消。')
                     self._assert_portal_route(wifi,route_token)
+                if nas_binding[0] is not None:
+                    nas_binding[0].validate(wifi,reader=lambda:current)
                 return current
             self.message('正在检查登录状态…')
             try:
@@ -1277,7 +1405,15 @@ class App:
             # Keep the original server identity even if the ordinary interface
             # temporarily clears the online record before its AC has gone down.
             original_report=dict(report)
-            if report.get('state')!='online':
+            can_use_portal=report.get('state')=='online'
+            if not can_use_portal and self.session_binding_conflict(report):
+                try:
+                    nas_binding[0]=self._verify_current_nas_portal(wifi,check_allowed)
+                    can_use_portal=True
+                    self.auth_diagnostic['nas_binding_verified']=True
+                except (selfservice.SelfServiceError,OSError,http.client.HTTPException) as exc:
+                    self.record_exception('logout.nas_binding_unavailable',exc)
+            if not can_use_portal:
                 self.logout_diagnostic['fallback_reason']=('previous_logout_unconfirmed'
                     if retry_recovery else 'preflight_unconfirmed')
                 self.record('logout.preflight_blocked',state=report.get('state'),
@@ -1285,7 +1421,10 @@ class App:
             else:
                 self.message('正在通过认证页面退出登录…')
                 try:
-                    result=self.run_authentication(wifi,'','',self.settings.get('operator',''),'logout',tec,check_allowed)
+                    try:
+                        result=self.run_authentication(wifi,'','',self.settings.get('operator',''),'logout',tec,check_allowed)
+                    finally:
+                        nas_binding[0]=None
                     self.logout_diagnostic['portal_result']=result
                     check_allowed()
                     report=self.session_engine(wifi,tec).status()
@@ -1331,7 +1470,9 @@ class App:
         from campus_browser import authenticate
         return authenticate(self,wifi,account,password,operator,operation,tec,
                             result_parser=authentication_result,
-                            logout_select_js=LOGOUT_JS,logout_confirm_js=LOGOUT_CONFIRM_JS)
+                            logout_select_js=LOGOUT_JS,logout_confirm_js=LOGOUT_CONFIRM_JS,
+                            reader=getattr(self,'_browser_auth_guard',None) or
+                                   (lambda:self.checked_wifi(wifi,tec)))
 
     def poll_wifi(self):
         """Show each campus connection independently of its optional authentication."""
@@ -1446,22 +1587,22 @@ class App:
         if popup:
             self.show_window()
         if attempt:
-            with self.lock:
-                try:
+            try:
+                with getattr(self,'_profile_io_lock',self.lock):
                     selected=self.store.selected_profile()
-                    if not selected.get('account') or not selected.get('password'):
-                        self.record('network.auto_login_skipped',reason='no_selected_profile')
-                        self.message('已连接校园网，请选择或填写账号后登录。')
-                    elif current.student and selected.get('operator') not in ('telecom','unicom','cmcc','campus'):
-                        self.record('network.auto_login_skipped',reason='operator_not_selected')
-                        self.message('已连接学生网，请选择账号对应的登录网络。')
-                    else:
-                        result=self.login(selected['account'],selected['password'],selected.get('operator',''),
-                                          selected.get('id',''),automatic=True,expected=current)
-                        if not result['ok']: self.message(result['message'])
-                except (RuntimeError,OSError) as exc:
-                    self.record_exception('network.auto_login_error',exc)
-                    self.message(str(exc))
+                if not selected.get('account') or not selected.get('password'):
+                    self.record('network.auto_login_skipped',reason='no_selected_profile')
+                    self.message('已连接校园网，请选择或填写账号后登录。')
+                elif current.student and selected.get('operator') not in ('telecom','unicom','cmcc','campus'):
+                    self.record('network.auto_login_skipped',reason='operator_not_selected')
+                    self.message('已连接学生网，请选择账号对应的登录网络。')
+                else:
+                    result=self.login(selected['account'],selected['password'],selected.get('operator',''),
+                                      selected.get('id',''),automatic=True,expected=current)
+                    if not result['ok']: self.message(result['message'])
+            except (RuntimeError,OSError) as exc:
+                self.record_exception('network.auto_login_error',exc)
+                self.message(str(exc))
         return current
 
     def consume_notifications(self):

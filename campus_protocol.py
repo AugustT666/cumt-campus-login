@@ -784,9 +784,15 @@ class Engine:
         # must re-read the server scripts even when the WiFi/IP is unchanged.
         self._plan = None
         self._guard()
+        portal_values={key.casefold():value for key,value in core.parse_qsl(
+            urlsplit(self.portal).query,keep_blank_values=True)}
+        portal_mac=next((portal_values[key] for key in ('mac','wlanusermac','wlan_user_mac')
+                         if key in portal_values),self.wifi.mac)
+        if _session_mac(portal_mac)!=_session_mac(self.wifi.mac):
+            raise UnsupportedPortal('门户设备地址与当前无线网卡不一致，未提交认证。')
         params = {'c': 'Portal', 'a': operation, 'callback': 'dr' + str(time.time_ns()),
                   'login_method': plan['login_method'], 'wlan_user_ip': self.wifi.ip,
-                  'wlan_user_mac': re.sub(r'[-:]', '', self.wifi.mac),
+                  'wlan_user_mac': re.sub(r'[-:]', '', portal_mac),
                   'wlan_ac_ip': plan['ac_ip'], 'wlan_ac_name': plan['ac_name'],
                   'jsVersion': plan['js_version']}
         if operation == 'login':

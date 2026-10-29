@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlencode
 
 import campus_core as core
 import campus_selfservice as service
@@ -108,9 +108,9 @@ class Harness:
                 raise AssertionError('Unexpected test path')
             def close(self):pass
         return Connection()
-    def client(self,reader=None,cleanup_reader=None):
+    def client(self,reader=None,cleanup_reader=None,**kwargs):
         return service.Client(WIFI,reader=reader or (lambda:WIFI),trace=self.trace,
-                              connection_factory=self.factory,cleanup_reader=cleanup_reader,sleeper=lambda _:None)
+                              connection_factory=self.factory,cleanup_reader=cleanup_reader,sleeper=lambda _:None,**kwargs)
     def count(self,path):return sum(p==path for _,p,*_ in self.requests)
 
 
@@ -387,6 +387,222 @@ class SelfServiceTests(unittest.TestCase):
         other=self.h.client(reader=lambda:WIFI,cleanup_reader=lambda:replace(WIFI,ip='10.61.42.20'))
         other.login(ACCOUNT,PASSWORD)
         self.assertFalse(other.close()['web_logout_confirmed'])
+
+
+def nas_target(**changes):
+    values={'nasip':'10.61.42.1','ssid':WIFI.ssid,'t':'synthetic-time',
+            'url':'http://9.9.9.9/','wlanacname':'synthetic-nas-controller',
+            'wlanuserip':WIFI.ip,'mac':WIFI.mac}
+    values.update(changes)
+    return 'http://10.2.5.251/a79.htm?'+urlencode(values)
+
+
+class NasBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.current=WIFI
+        self.tick=100.0
+        self.calls=[]
+        self.response=(302,nas_target(),'')
+        self.on_get=None
+        self.enterContext(patch.object(core,'Store',side_effect=AssertionError('No Store')))
+        self.enterContext(patch.object(core,'fresh_url',side_effect=AssertionError('Never synthesize NAS proof')))
+
+    def clock(self):return self.tick
+    def reader(self):return self.current
+    def getter(self,url,wifi,reader,allow_tec):
+        self.assertIn(url,service.NAS_PROBES)
+        self.assertEqual(wifi,self.current)
+        self.assertEqual(reader(),self.current)
+        self.assertIs(allow_tec,wifi.ssid==core.TEC)
+        self.calls.append(url)
+        if self.on_get:self.on_get()
+        return self.response
+    def observe(self):
+        return service.observe_nas_binding(self.current,reader=self.reader,getter=self.getter,clock=self.clock)
+
+    def test_raw_http_redirect_mints_short_lived_context_bound_proof(self):
+        proof=self.observe()
+        self.assertEqual(proof.portal_url,nas_target())
+        self.assertTrue(proof.validate(WIFI,reader=self.reader,clock=self.clock))
+        self.assertEqual(self.calls,[service.NAS_PROBES[0]])
+        self.tick+=service.NAS_BINDING_TTL+.01
+        with self.assertRaises(service.UnsupportedService):proof.validate(WIFI,reader=self.reader,clock=self.clock)
+
+    def test_proof_cannot_be_constructed_from_json_or_copied_with_new_fields(self):
+        proof=self.observe()
+        forged=service.NasBinding(proof.portal_url,proof.context,proof.observed_at)
+        changed=replace(proof,portal_url=proof.portal_url)
+        for value in (forged,changed):
+            with self.assertRaises(service.UnsupportedService):value.validate(WIFI,reader=self.reader,clock=self.clock)
+
+    def test_proof_expiry_during_final_reader_is_checked_again(self):
+        proof=self.observe()
+        def slow_reader():self.tick+=11;return WIFI
+        with self.assertRaises(service.UnsupportedService):proof.validate(WIFI,reader=slow_reader,clock=self.clock)
+
+    def test_complete_physical_network_context_is_required(self):
+        proof=self.observe()
+        changes=[replace(WIFI,ssid=core.STU),replace(WIFI,guid='other-fixture'),
+                 replace(WIFI,index=19),replace(WIFI,ip='10.61.42.20'),
+                 replace(WIFI,mac='66-77-88-99-AA-BB'),replace(WIFI,gateway='10.61.42.1')]
+        for changed in changes:
+            with self.subTest(field_change=changed!=WIFI),self.assertRaises(RuntimeError):
+                proof.validate(WIFI,reader=lambda:changed,clock=self.clock)
+
+    def test_observation_checks_context_before_and_after_raw_response(self):
+        self.on_get=lambda:setattr(self,'current',replace(WIFI,gateway='10.61.42.1'))
+        with self.assertRaises(RuntimeError):self.observe()
+
+    def test_untrusted_host_or_missing_and_ambiguous_parameters_do_not_authorize(self):
+        bad=[nas_target().replace('10.2.5.251','untrusted.invalid'),
+             nas_target().replace('http://','http://user@'),
+             nas_target()+'&MAC=001122334455',nas_target()+'#ignored',
+             nas_target(mac=''),nas_target(mac='000000000000'),
+             nas_target(mac='66778899AABB'),nas_target(wlanuserip='10.61.42.20'),
+             nas_target(wlanacname=''),nas_target(nasip='0.0.0.0'),
+             nas_target(nasip='127.0.0.1'),nas_target(nasip='255.255.255.255'),
+             nas_target(nasip='not-an-ip'),nas_target().replace('nasip=','other=')]
+        for target in bad:
+            with self.subTest(index=bad.index(target)):
+                self.response=(302,target,'')
+                with self.assertRaises(service.UnsupportedService):self.observe()
+
+    def test_missing_raw_fields_are_not_repaired_from_current_wifi(self):
+        self.response=(302,'http://10.2.5.251/a79.htm?wlanacname=fixture&nasip=10.61.42.1','')
+        with self.assertRaises(service.UnsupportedService):self.observe()
+
+    def test_literal_js_redirects_are_recognized_without_executing_code(self):
+        for script in ("location.href='URL';",'window.location.replace("URL");',"top.location='URL';"):
+            self.response=(200,'','<html><script>'+script.replace('URL',nas_target())+'</script></html>')
+            self.assertEqual(self.observe().portal_url,nas_target())
+
+    def test_comments_strings_multiple_scripts_and_nonliteral_js_are_not_proof(self):
+        scripts=["// location.href='URL';",'var text="location.href=\'URL\'";',
+                 "location.href='URL';doSomething();",'location.href=someVariable;']
+        for script in scripts:
+            self.response=(200,'','<script>'+script.replace('URL',nas_target())+'</script>')
+            with self.assertRaises(service.UnsupportedService):self.observe()
+        self.response=(200,'',"<script>location='"+nas_target()+"';</script><script>other()</script>")
+        with self.assertRaises(service.UnsupportedService):self.observe()
+
+    def test_raw_observation_does_not_publish_private_urls_through_core_trace(self):
+        traces=[]
+        original=self.getter
+        def traced(*args,**kwargs):
+            core.trace('synthetic.nas',url=nas_target())
+            return original(*args,**kwargs)
+        with core.trace_scope(lambda event,**fields:traces.append((event,fields))):
+            service.observe_nas_binding(WIFI,reader=self.reader,getter=traced,clock=self.clock)
+        self.assertEqual(traces,[])
+
+
+class NasGhostSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(core,'Store',side_effect=AssertionError('No Store')))
+        self.h=Harness()
+        self.ghost=dict(OWN,mac='000000000000')
+        self.third=dict(OTHER,sessionId='fictional-third-session',ip='10.61.42.11',mac='AABBCCDDEEFF')
+        self.h.devices=[copy.deepcopy(self.ghost),copy.deepcopy(OTHER),copy.deepcopy(self.third)]
+        self.tick=100.0
+        self.nas_calls=[]
+        self.response=(302,nas_target(),'')
+    def clock(self):return self.tick
+    def getter(self,url,wifi,reader,allow_tec):
+        self.assertEqual(reader(),WIFI)
+        self.nas_calls.append(url)
+        return self.response
+    def login(self,**kwargs):
+        c=self.h.client(nas_getter=self.getter,clock=self.clock,**kwargs)
+        self.addCleanup(c.close);c.login(ACCOUNT,PASSWORD);return c
+
+    def test_unique_current_ip_zero_mac_uses_fresh_nas_proof_and_preserves_other_devices(self):
+        c=self.login();result=c.disconnect_current()
+        self.assertTrue(result['current_device_offline'])
+        self.assertEqual(self.h.count(service.DISCONNECT),1)
+        self.assertEqual(self.h.devices,[OTHER,self.third])
+        self.assertEqual(self.nas_calls,[service.NAS_PROBES[0]])
+        self.assertTrue(all(d['mac']!='000000000000' for d in self.h.devices))
+
+    def test_public_selection_uses_same_authenticated_client_and_rejects_json_proof_injection(self):
+        c=self.login();rows=c.list_online_devices()
+        self.response=(302,'http://untrusted.invalid/','')
+        with self.assertRaises(service.UnsupportedService):
+            c.select_current_session(rows,{'nas_binding':{'portal_url':nas_target(),'context':WIFI.key}})
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_valid_different_mac_is_never_replaced_by_ip_only_nas_match(self):
+        self.h.devices=[dict(self.ghost,mac='112233445566'),OTHER]
+        c=self.login()
+        with self.assertRaises(service.NoMatchingDevice):c.disconnect_current()
+        self.assertEqual(self.nas_calls,[])
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_duplicate_current_ip_with_missing_mac_is_ambiguous_before_nas_probe(self):
+        self.h.devices.append(dict(self.ghost,sessionId='second-fictional-ghost'))
+        c=self.login()
+        with self.assertRaises(service.AmbiguousDevice):c.disconnect_current()
+        self.assertEqual(self.nas_calls,[])
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_changed_ghost_session_id_or_valid_different_mac_stops_before_action(self):
+        for changed in (dict(self.ghost,sessionId='new-fictional-id'),dict(self.ghost,mac='112233445566')):
+            self.h=Harness();self.h.devices=[self.ghost,OTHER]
+            c=self.login();self.h.list_responses=[[self.ghost,OTHER],[changed,OTHER]]
+            with self.assertRaises(service.SelfServiceError):c.disconnect_current()
+            self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_same_owner_is_required_across_both_fresh_reads(self):
+        c=self.login();self.h.list_responses=[[self.ghost],[dict(self.ghost,userId=999)]]
+        with self.assertRaises(service.AuthenticationError):c.disconnect_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_expired_cached_proof_cannot_authorize_a_later_disconnect(self):
+        c=self.login();c.select_current_session(c.list_online_devices())
+        self.tick+=11
+        with self.assertRaises(service.UnsupportedService):c.disconnect_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(len(self.nas_calls),1)
+
+    def test_expiry_at_before_disconnect_callback_is_not_a_submission(self):
+        c=self.login()
+        with self.assertRaises(service.UnsupportedService):
+            c.disconnect_current(before_disconnect=lambda:setattr(self,'tick',self.tick+11))
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(c.safe_summary()['disconnect_requests'],0)
+
+    def test_slow_tcp_setup_rechecks_ttl_before_sending_or_counting_action(self):
+        c=self.login();original=c.connection_factory
+        def factory(*args):
+            conn=original(*args)
+            conn.connect=lambda:setattr(self,'tick',self.tick+11)
+            return conn
+        c.connection_factory=factory
+        with self.assertRaises(service.UnsupportedService):c.disconnect_current()
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+        self.assertEqual(c.safe_summary()['disconnect_requests'],0)
+
+    def test_gateway_change_after_precheck_stops_precise_disconnect(self):
+        current=[WIFI]
+        c=self.login(reader=lambda:current[0],cleanup_reader=lambda:WIFI)
+        with self.assertRaises(RuntimeError):
+            c.disconnect_current(before_disconnect=lambda:current.__setitem__(0,replace(WIFI,gateway='10.61.42.1')))
+        self.assertEqual(self.h.count(service.DISCONNECT),0)
+
+    def test_same_ip_ghost_reappearing_after_removal_is_not_reported_offline(self):
+        c=self.login();self.h.after_disconnect=[OTHER,dict(self.ghost,sessionId='reappeared-fictional-ghost')]
+        result=c.disconnect_current()
+        self.assertTrue(result['device_reappeared'])
+        self.assertFalse(result['current_device_offline'])
+        self.assertEqual(self.h.count(service.DISCONNECT),1)
+
+    def test_nas_trace_contains_only_proof_type_and_boolean_not_private_fields(self):
+        c=self.login();c.disconnect_current()
+        traces=json.dumps(self.h.traces)
+        for value in (nas_target(),WIFI.ip,WIFI.mac,'10.61.42.1','synthetic-nas-controller',OWN['sessionId']):
+            self.assertNotIn(value,traces)
+        events=[f for e,f in self.h.traces if e=='selfservice.binding_verified']
+        self.assertTrue(events)
+        self.assertTrue(all(f=={'proof_type':'nas_current_ip','verified':True} for f in events))
 
 
 class DeviceListFormatTests(unittest.TestCase):
