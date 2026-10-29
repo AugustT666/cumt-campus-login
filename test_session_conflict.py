@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,7 @@ import zipfile
 
 import campus_app as app
 import campus_core as core
+import campus_selfservice as selfservice
 from campus_logging import RuntimeLog
 
 
@@ -68,6 +70,14 @@ class ConflictFixture(unittest.TestCase):
         self.client.operation_id = 'fixture-initial'
         self.jobs = 0
         self.client.start_job = self.inline_job
+        self.tick = 100.0
+        self.enterContext(patch.object(app.time, 'monotonic', side_effect=lambda: self.tick))
+        self.client._logout_wait = lambda seconds: setattr(self, 'tick', self.tick + seconds)
+        self.enterContext(patch.object(core, 'internet_check', return_value={'online': False, 'checks': []}))
+        self.service_client = self.enterContext(patch.object(selfservice, 'Client',
+            side_effect=AssertionError('No live self-service in conflict tests')))
+        self.enterContext(patch.object(socket.socket, 'connect',
+            side_effect=AssertionError('No live sockets in conflict tests')))
 
     def inline_job(self, kind, job, automatic=False):
         self.jobs += 1
@@ -177,6 +187,10 @@ class SessionConflictTests(ConflictFixture):
         self.client.auth_diagnostic = {'authentication_requests': 1, 'operation': 'login'}
         self.client.logout()
         self.client.run_authentication.assert_not_called()
+        self.service_client.assert_not_called()
+        self.assertEqual(self.client.auth_diagnostic['authentication_requests'], 0)
+        self.assertEqual(self.client.auth_diagnostic['selfservice_logout_requests'], 0)
+        self.assertNotEqual(self.client.logout_diagnostic['outcome'], 'offline_confirmed')
         self.assertIn('本次未发送注销请求', self.client.status)
         self.assertIn('自助服务', self.client.status)
         rows = self.events('logout.preflight_blocked')

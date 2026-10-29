@@ -88,7 +88,9 @@ def main():
         assert page.locator('#online-account').inner_text()=='接入下线尚未确认'
         assert page.locator('#logout-button').is_enabled()
         assert page.locator('#session-recovery').is_visible()
-        page.evaluate("window.fakeState.logout_recovery_needed=false;refresh()")
+        page.locator('#logout-button').click()
+        page.wait_for_function("!actionBusy&&window.fakeLog.filter(x=>x[0]==='logout').length===1")
+        page.evaluate("window.fakeLog=window.fakeLog.filter(x=>x[0]!=='logout');window.fakeState.logout_recovery_needed=false;refresh()")
         assert page.locator('#logout-button').is_disabled()
         # Export success, explicit failure and rejected bridge calls must all
         # produce visible feedback, including while the modal help is open.

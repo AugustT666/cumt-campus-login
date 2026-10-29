@@ -10,6 +10,7 @@ import zipfile
 import campus_app as app
 import campus_core as core
 import campus_protocol as protocol
+import campus_selfservice as selfservice
 from test_protocol import MemoryPortal, documents, fixture_fingerprints
 
 
@@ -98,6 +99,12 @@ class AppNetworkFeedbackTests(unittest.TestCase):
         self.enterContext(patch.object(core, 'read_wifi', return_value=WIFI))
         self.enterContext(patch.object(core, 'discover', side_effect=AssertionError('No discovery allowed')))
         self.enterContext(patch.object(socket.socket, 'connect', side_effect=AssertionError('No live sockets')))
+        self.tick = 100.0
+        self.enterContext(patch.object(app.time, 'monotonic', side_effect=lambda: self.tick))
+        self.client._logout_wait = lambda seconds: setattr(self, 'tick', self.tick + seconds)
+        self.enterContext(patch.object(core, 'internet_check', return_value={'online': False, 'checks': []}))
+        self.service_client = self.enterContext(patch.object(selfservice, 'Client',
+            side_effect=AssertionError('No live self-service in network feedback tests')))
 
     def tearDown(self):
         self.client.runtime_log.close()
@@ -145,8 +152,14 @@ class AppNetworkFeedbackTests(unittest.TestCase):
     def test_logout_unknown_keeps_denial_without_sending_logout(self):
         self.client.logout()
         self.assertIn('10013', self.client.status)
-        self.assertIn('再注销', self.client.status)
+        self.assertIn('尚未确认', self.client.status)
         self.client.run_authentication.assert_not_called()
+        self.service_client.assert_not_called()
+        self.assertEqual(self.client.auth_diagnostic['authentication_requests'], 0)
+        self.assertEqual(self.client.auth_diagnostic['selfservice_logout_requests'], 0)
+        self.assertEqual(self.client.session_state, 'unknown')
+        self.assertEqual(self.client.session_diagnostic['network_error']['winerror'], 10013)
+        self.assertNotEqual(self.client.logout_diagnostic['outcome'], 'offline_confirmed')
 
     def test_other_unknown_status_still_allows_explicit_manual_attempt(self):
         self.engine.status.return_value = {'state': 'unknown',

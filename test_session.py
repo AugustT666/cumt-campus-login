@@ -1,6 +1,8 @@
 """Session recovery uses explicit server state, never saved client flags."""
 import datetime as dt
 import json
+from itertools import chain, repeat
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import zipfile
 import campus_core as core
 import campus_app as app
+import campus_selfservice as selfservice
 
 WIFI=core.Wifi('CUMT_Stu','session-fixture',5,'10.52.1.2','00-11-22-33-44-55')
 
@@ -29,12 +32,32 @@ class SessionTests(unittest.TestCase):
         self.app.start_job=lambda kind,job,automatic=False:(job() or {'ok':True})
         self.wifi_patch=patch.object(core,'read_wifi',return_value=WIFI)
         self.wifi_patch.start()
+        self.tick=100.0
+        self.enterContext(patch.object(app.time,'monotonic',side_effect=lambda:self.tick))
+        self.app._logout_wait=lambda seconds:setattr(self,'tick',self.tick+seconds)
+        self.enterContext(patch.object(core,'internet_check',return_value={'online':False,'checks':[]}))
+        self.service_client=self.enterContext(patch.object(selfservice,'Client',
+            side_effect=AssertionError('No live self-service in session tests')))
+        self.enterContext(patch.object(socket.socket,'connect',
+            side_effect=AssertionError('No live sockets in session tests')))
     def tearDown(self):
         self.wifi_patch.stop()
         self.app.runtime_log.close()
         self.temp.cleanup()
     def login(self,automatic=False):
         return self.app.login('fake-account','fake-password','campus','',automatic=automatic)
+    def logout_reports(self,*reports):
+        # Authentication can settle slowly. Keep the final synthetic report
+        # available throughout read-only observation; never sleep in a test.
+        self.engine.status.side_effect=chain(reports,repeat(reports[-1]))
+
+    def logout_result(self,result,response=None):
+        def submit(*args,**kwargs):
+            self.app.auth_diagnostic={'operation':'logout','backend':'fixture-portal',
+                'authentication_requests':1,'result':result,'phase':'response_received'}
+            if response is not None:self.app.auth_diagnostic['response']=response
+            return result
+        self.app.run_authentication.side_effect=submit
     def test_reopen_recovers_online_session_without_authentication(self):
         self.assertFalse(self.app.logged_in)
         self.engine.status.return_value={'state':'online','matched_ip':True}
@@ -50,14 +73,17 @@ class SessionTests(unittest.TestCase):
         self.app.run_authentication.assert_not_called()
         self.assertEqual(self.app.auth_diagnostic['authentication_requests'],0)
     def test_recovered_session_can_logout_without_saved_credentials(self):
-        self.engine.status.side_effect=[{'state':'online','matched_ip':True},
-                                        {'state':'offline','matched_ip':True}]
+        self.logout_reports({'state':'online','matched_ip':True},
+                            {'state':'offline','matched_ip':True})
+        start=self.tick
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
         self.assertEqual(self.app.run_authentication.call_args.args[4],'logout')
         self.assertFalse(self.app.logged_in)
         self.assertEqual(self.app.session_state,'offline')
-        self.assertEqual(self.engine.status.call_count,2)
+        self.assertGreater(self.engine.status.call_count,2)
+        self.assertGreaterEqual(self.tick-start,65.0)
+        self.service_client.assert_not_called()
     def test_logout_offline_sends_no_authentication(self):
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_not_called()
@@ -66,6 +92,9 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(self.app.logout()['ok'])
         self.assertFalse(self.app.logged_in)
         self.app.run_authentication.assert_not_called()
+        self.service_client.assert_not_called()
+        self.assertEqual(self.app.auth_diagnostic['authentication_requests'],0)
+        self.assertNotEqual(self.app.logout_diagnostic['outcome'],'offline_confirmed')
     def test_explicit_offline_clears_previous_online_flag(self):
         self.app.logged_in=True;self.app.auth_key=WIFI.key
         self.app.refresh_status()
@@ -291,66 +320,83 @@ class SessionTests(unittest.TestCase):
             snapshot=json.loads(archive.read('snapshot.json'))
             self.assertEqual(snapshot['session']['query']['online_account'],'[REDACTED]')
 
-    def test_explicit_logout_rejection_retains_online_account_and_school_reason(self):
-        self.engine.status.side_effect=[self.online(),self.online()]
-        self.app.auth_diagnostic={'operation':'logout','result':False,'response':{'result':'0','msg':'注销失败'}}
-        self.app.run_authentication.return_value=False
-        self.app.authenticate=MagicMock(side_effect=AssertionError('No alternate transport allowed'))
+    def test_explicit_logout_rejection_retains_identity_and_reason_when_no_safe_fallback_credentials(self):
+        self.logout_reports(self.online(),self.online())
+        self.logout_result(False,{'result':'0','msg':'注销失败'})
+        self.app.authenticate=MagicMock(side_effect=AssertionError('No blind browser retry allowed'))
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
         self.app.authenticate.assert_not_called()
+        self.service_client.assert_not_called()
         self.assertEqual(self.engine.status.call_count,2)
         self.assertTrue(self.app.logged_in)
         self.assertEqual(self.app.get_state()['online_account'],'fixture-server-online-user')
         self.assertEqual(self.app.get_state()['identity_source'],'server')
-        self.assertIn('学校认证服务器拒绝注销',self.app.status)
-        self.assertIn('仍在线',self.app.status)
         self.assertEqual(self.app.auth_diagnostic['response']['msg'],'注销失败')
+        self.assertFalse(self.app.auth_diagnostic['result'])
+        self.assertEqual(self.app.auth_diagnostic['authentication_requests'],1)
+        self.assertEqual(self.app.auth_diagnostic['selfservice_logout_requests'],0)
+        self.assertEqual(self.app.logout_diagnostic['fallback_reason'],'portal_rejected')
+        self.assertIn('注销尚未确认',self.app.status)
         self.assertNotIn('已退出登录',self.app.status)
 
-    def test_unknown_logout_response_never_retries_or_switches_transport(self):
-        self.engine.status.side_effect=[self.online(),self.online()]
-        self.app.run_authentication.return_value=None
-        self.app.authenticate=MagicMock(side_effect=AssertionError('No alternate transport allowed'))
+    def test_unknown_logout_response_never_resubmits_portal_and_retains_uncertainty(self):
+        self.logout_reports(self.online(),self.online())
+        self.logout_result(None)
+        self.app.authenticate=MagicMock(side_effect=AssertionError('No blind browser retry allowed'))
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
         self.app.authenticate.assert_not_called()
-        self.assertEqual(self.engine.status.call_count,2)
+        self.service_client.assert_not_called()
+        self.assertGreater(self.engine.status.call_count,2)
         self.assertTrue(self.app.logged_in)
         self.assertEqual(self.app.get_state()['online_account'],'fixture-server-online-user')
-        self.assertIn('结果未知',self.app.status)
-        self.assertIn('未再次提交',self.app.status)
+        self.assertIsNone(self.app.auth_diagnostic['result'])
+        self.assertEqual(self.app.auth_diagnostic['authentication_requests'],1)
+        self.assertEqual(self.app.logout_diagnostic['fallback_reason'],'still_online')
+        self.assertTrue(self.app.get_state()['logout_recovery_needed'])
+        self.assertIn('尚未确认',self.app.status)
+        self.assertNotIn('已退出登录',self.app.status)
 
     def test_accepted_logout_with_online_readback_does_not_claim_logged_out(self):
-        self.engine.status.side_effect=[self.online(),self.online()]
-        self.app.run_authentication.return_value=True
+        self.logout_reports(self.online(),self.online())
+        self.logout_result(True)
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
-        self.assertEqual(self.engine.status.call_count,2)
+        self.service_client.assert_not_called()
+        self.assertGreater(self.engine.status.call_count,2)
         self.assertTrue(self.app.logged_in)
         self.assertEqual(self.app.get_state()['online_account'],'fixture-server-online-user')
-        self.assertIn('已接受注销',self.app.status)
+        self.assertTrue(self.app.auth_diagnostic['result'])
+        self.assertEqual(self.app.logout_diagnostic['fallback_reason'],'still_online')
         self.assertIn('尚未确认',self.app.status)
         self.assertNotIn('已退出登录',self.app.status)
 
     def test_explicit_rejection_with_unknown_readback_clears_identity_and_keeps_rejection(self):
-        self.engine.status.side_effect=[self.online(),{'state':'unknown','matched_ip':False}]
-        self.app.run_authentication.return_value=False
+        self.logout_reports(self.online(),{'state':'unknown','matched_ip':False})
+        self.logout_result(False,{'result':'0','msg':'注销失败'})
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
+        self.service_client.assert_not_called()
         self.assertEqual(self.app.get_state()['session_state'],'unknown')
         self.assertEqual(self.app.get_state()['online_account'],'')
-        self.assertIn('拒绝注销',self.app.status)
-        self.assertIn('暂不确定',self.app.status)
+        self.assertFalse(self.app.auth_diagnostic['result'])
+        self.assertEqual(self.app.auth_diagnostic['response']['msg'],'注销失败')
+        self.assertIn('尚未确认',self.app.status)
+        self.assertTrue(self.app.get_state()['logout_recovery_needed'])
 
-    def test_offline_readback_confirms_end_of_session_even_if_response_was_rejected(self):
-        self.engine.status.side_effect=[self.online(),{'state':'offline','matched_ip':True}]
-        self.app.run_authentication.return_value=False
+    def test_sustained_offline_readback_confirms_session_even_if_response_was_rejected(self):
+        self.logout_reports(self.online(),{'state':'offline','matched_ip':True})
+        self.logout_result(False)
+        start=self.tick
         self.assertTrue(self.app.logout()['ok'])
         self.app.run_authentication.assert_called_once()
+        self.service_client.assert_not_called()
+        self.assertGreaterEqual(self.tick-start,65.0)
         self.assertFalse(self.app.logged_in)
         self.assertEqual(self.app.get_state()['online_account'],'')
         self.assertEqual(self.app.get_state()['identity_source'],'')
-        self.assertIn('服务器状态已确认',self.app.status)
+        self.assertFalse(self.app.auth_diagnostic['result'])
+        self.assertIn('持续确认离线',self.app.status)
 
 if __name__=='__main__':unittest.main()
