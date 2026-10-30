@@ -206,6 +206,64 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(trace['phase'], 'response_unconfirmed')
         self.assertEqual(trace['error'], 'TimeoutError')
 
+    def reply_without_late_wifi_read(self, response, expected, *, changed=False,
+                                    http_status=200, location=''):
+        memory = MemoryPortal(self.docs)
+        memory.response = response
+        arrived = False
+        late_reads = []
+        def reader():
+            if arrived:
+                late_reads.append(True)
+                if changed:
+                    return replace(WIFI, ip='10.52.151.132')
+                raise RuntimeError('Fictional WLAN read failed after reply')
+            return WIFI
+        def getter(url, wifi, **kwargs):
+            nonlocal arrived
+            reply = memory.get(url, wifi, **kwargs)
+            if urlsplit(url).path == '/eportal/':
+                arrived = True
+                return http_status, location, reply[2]
+            return reply
+        engine = protocol.Engine(WIFI, PORTAL, reader=reader, getter=getter)
+        result, trace = engine.authenticate(ACCOUNT, PASSWORD, 'campus')
+        self.assertIs(result, expected)
+        self.assertIs(trace['result'], expected)
+        self.assertEqual(trace['phase'], 'response_received' if expected is not None else 'response_unconfirmed')
+        self.assertEqual(late_reads, [], 'A received reply must not depend on a later native WLAN read')
+        self.assertEqual(len(memory.submissions), 1)
+        self.assertEqual(trace['authentication_requests'], 1)
+        self.assertNotIn('error', trace)
+
+    def test_received_success_survives_later_native_read_failure(self):
+        self.reply_without_late_wifi_read({'result': 1}, True)
+
+    def test_received_rejection_and_unknown_are_preserved_without_native_reads(self):
+        for response, expected in (({'result': 0, 'msg': '认证失败'}, False),
+                                   ({'result': 'pending'}, None),
+                                   ({'unrecognized': 1}, None)):
+            with self.subTest(response=response):
+                self.reply_without_late_wifi_read(response, expected)
+
+    def test_network_change_after_reply_does_not_rewrite_received_ack(self):
+        # The application separately scopes feedback to retained network state;
+        # the protocol layer must preserve the fact that this request was ACKed.
+        self.reply_without_late_wifi_read({'result': 1}, True, changed=True)
+
+    def test_unconfirmed_http_reply_is_not_upgraded_by_skipping_late_wifi_read(self):
+        for status, location in ((500, ''), (200, '/a79.htm')):
+            with self.subTest(status=status, location=location):
+                self.reply_without_late_wifi_read({'result': 1}, None,
+                                                 http_status=status, location=location)
+
+    def test_network_change_before_submit_still_blocks_credentials(self):
+        def changed():
+            self.engine.reader = lambda: replace(WIFI, ip='10.52.151.132')
+        with self.assertRaises(RuntimeError):
+            self.engine.authenticate(ACCOUNT, PASSWORD, 'campus', before_submit=changed)
+        self.assertEqual(self.memory.submissions, [])
+
     def test_explicit_failure_is_not_retried(self):
         self.memory.response = {'result': 0, 'msg': '认证失败'}
         result, trace = self.engine.authenticate(ACCOUNT, PASSWORD, 'campus')

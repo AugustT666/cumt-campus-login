@@ -824,7 +824,11 @@ class Engine:
         # request.  Return inconclusive evidence; NEVER fall back and resubmit.
         try:
             status, location, text = self._get(plan['endpoint'] + '?' + urlencode(params))
-            self._guard()
+            # The response belongs to the one request already sent. A later
+            # WLAN read can fail or observe a changed connection even after a
+            # valid ACK arrived; neither changes that receipt. All credential
+            # admission guards stay before submission. The application scopes
+            # the received reply to its retained operation/network context.
             data = parse_jsonp(text) if status == 200 and not location else None
             result = _result(data)
             trace.update(phase='response_received' if result is not None else 'response_unconfirmed',

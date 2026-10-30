@@ -6,15 +6,15 @@
 
 用于中国矿业大学校园 WiFi 的 Windows 登录工具，支持保存多个账号、登录、注销和连接后自动弹出。
 
-**当前版本：v1.8.0，约 10.88 MB。**
+**当前版本：v1.8.1，约 10.88 MB。**
 
-[下载 Windows 版](https://github.com/AugustT666/cumt-campus-login/releases/tag/v1.8.0) · [更新记录](CHANGELOG.md)
+[下载 Windows 版](https://github.com/AugustT666/cumt-campus-login/releases/tag/v1.8.1) · [更新记录](CHANGELOG.md)
 
 ## 下载与运行
 
 支持 Windows 10 / 11，需要系统已安装 WebView2 Runtime，通常系统已自带无需额外安装。
 
-在下载页选择 `cumt-campus-login-v1.8.0.exe`，下载后直接打开，无需安装 Python。
+在下载页选择 `cumt-campus-login-v1.8.1.exe`，下载后直接打开，无需安装 Python。
 
 目前提供 Windows 版，Mac 和 Linux 版计划中。
 

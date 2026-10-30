@@ -106,6 +106,51 @@ class WebView2ParityTests(unittest.TestCase):
         self.assertEqual(item['query']['viewport'], ['1280x720'])
 
 
+class WebView2AlreadyOnlineFeedbackTests(unittest.TestCase):
+    def run_reply(self, fields, operation='login'):
+        if operation=='login':
+            html=(DOCUMENT+'<form name="loginForm">'+FIELDS+
+                  '<button type="submit" onclick="return sendLogin(event)">登录</button>'
+                  '</form><script>'+SEND+'</script>')
+        else:
+            html=(DOCUMENT+'<button onclick="sendLogout(event)">注销</button>'
+                  '<script>'+SEND+'</script>')
+        fixture=PortalFixture(html,result=0)
+        response=fixture.response
+        def reply(text,*args,**kwargs):
+            if isinstance(text,str) and text.startswith('dr1003('):
+                text='dr1003('+json.dumps(fields)+')'
+            return response(text,*args,**kwargs)
+        fixture.response=reply
+        messages=[]
+        fixture.client.message=messages.append
+        result,error=fixture.run(operation=operation,result_timeout=1.0)
+        self.assertIs(result,False,fixture.client.auth_diagnostic)
+        self.assertIsNone(error)
+        self.assertEqual(len(fixture.submissions),1)
+        self.assertEqual(fixture.client.auth_diagnostic['authentication_requests'],1)
+        self.assertIs(fixture.client.auth_diagnostic['result'],False)
+        return messages
+
+    def test_already_online_login_keeps_false_receipt_without_raw_error_flash(self):
+        for value,code in (('0','2'),(0,2)):
+            with self.subTest(value=value,code=code):
+                messages=self.run_reply({'result':value,'ret_code':code,'msg':'QUM5OTk='})
+                self.assertEqual(messages,[])
+
+    def test_real_rejection_detail_remains_visible(self):
+        messages=self.run_reply({'result':'0','ret_code':'1','msg':'Fictional server rejection'})
+        self.assertEqual(messages,['认证提示：Fictional server rejection'])
+
+    def test_noncanonical_code_two_does_not_hide_rejection(self):
+        messages=self.run_reply({'result':'0','ret_code':2.0,'msg':'Fictional server rejection'})
+        self.assertEqual(messages,['认证提示：Fictional server rejection'])
+
+    def test_code_two_does_not_hide_a_logout_rejection(self):
+        messages=self.run_reply({'result':'0','ret_code':'2','msg':'Fictional server rejection'},'logout')
+        self.assertEqual(messages,['认证提示：Fictional server rejection'])
+
+
 class WebView2FrameIsolationTests(unittest.TestCase):
     def test_frame_authentication_still_shares_the_single_submission_gate(self):
         html = (DOCUMENT + '<iframe id="child" src="/safe-frame.htm" style="display:none"></iframe>'

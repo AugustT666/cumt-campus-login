@@ -212,6 +212,20 @@ def main():
         page.evaluate("window.fakeState.quiet_hours_active=false;window.fakeState.status='本次登录请求已接受';refresh();el('toast').style.display='none'")
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth&&document.documentElement.scrollHeight<=innerHeight')
         page.screenshot(path=str(REPORTS/f'登录器_v{c.VERSION}_已登录界面.png'),full_page=True)
+        # A native 690px window has about 651px of usable WebView height.
+        # Exercise both network forms and the longer neutral action replies.
+        original_viewport=page.viewport_size
+        for height in (651,631):
+            page.set_viewport_size({'width':430,'height':height})
+            for ssid in ('CUMT_Stu','CUMT_Tec'):
+                for feedback in ('当前设备已在线，本次未重新登录；如需切换账号，请先用原账号注销。',
+                                 '该账号下未发现本机在线会话，未发送注销请求。'):
+                    page.evaluate("([ssid,status])=>{window.fakeState.ssid=ssid;window.fakeState.status=status;refresh()}",[ssid,feedback])
+                    assert page.evaluate('document.documentElement.scrollHeight<=innerHeight')
+                    assert page.locator('#login-button').is_visible() and page.locator('#logout-button').is_visible()
+        page.set_viewport_size(original_viewport)
+        page.evaluate("window.fakeState.ssid='CUMT_Stu';window.fakeState.status='本次登录请求已接受';refresh()")
+
         pause=a.student_auth_time_notice(c.Wifi(c.STU),a.dt.datetime(2026,10,27,0,15))+' 认证提示：Authentication Fail ErrCode=16'
         page.evaluate("text=>{window.fakeState.status=text;refresh()}",pause)
         page.wait_for_function("el('status').textContent.includes('今日07:00')")
