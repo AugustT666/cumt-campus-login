@@ -1,9 +1,11 @@
-"""The product submits one precise self-service logout; verification is external."""
+"""One precise self-service submission plus bounded, synthetic effect confirmation."""
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import socket
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 import campus_app as app
@@ -15,8 +17,19 @@ WIFI=core.Wifi(core.TEC,'simple-actions-fixture',7,'10.61.55.9','00-11-22-33-44-
 HOTSPOT=replace(WIFI,ssid='Fictional hotspot')
 ACCOUNT='fictional-selected-account'
 PASSWORD='fictional-selected-password'
-def online():return {'state':'online','online_account':ACCOUNT,'binding':'mac_verified','matched_ip':True}
-def offline():return {'state':'offline','matched_ip':True}
+def online():return {'state':'online','online_account':ACCOUNT,'binding':'mac_verified','matched_ip':True,
+    'mac_conflict':False,'ip_conflict':False,'server_mac':'001122334455','server_ip':WIFI.ip,'detail':'server_confirmed'}
+def offline():return {'state':'offline','online_account':'','binding':'source_ip_only','matched_ip':True,
+    'mac_conflict':False,'ip_conflict':False,'server_mac':'','server_ip':'','detail':'server_confirmed'}
+
+def unknown():return {'state':'unknown','online_account':'','binding':'unconfirmed','matched_ip':False,
+    'mac_conflict':False,'ip_conflict':False,'detail':'short_check_timeout'}
+
+def confirmation(state):
+    report={'offline':offline,'online':online}.get(state,unknown)()
+    return {'state':state,'outcome':{'offline':'confirmed_offline','online':'still_online'}.get(state,'unknown'),
+        'status':report,'verification_performed':True,'device_presence':'absent' if state=='offline' else 'present' if state=='online' else 'unavailable',
+        'samples':[{'state':state,'elapsed_ms':0},{'state':state,'elapsed_ms':700}],'elapsed_ms':700}
 
 class FakeWebClient:
     def __init__(self):
@@ -65,6 +78,31 @@ class LogoutRecoveryFixture(unittest.TestCase):
         self.enterContext(patch.object(app,'stable_instance_running',return_value=False))
         self.status_query=self.enterContext(patch.object(app.protocol.Engine,'status',side_effect=AssertionError('Product queried status')))
         self.internet=self.enterContext(patch.object(core,'internet_check',side_effect=AssertionError('Product checked connectivity')))
+        # Replace only App's clock, not the global time module used by transport
+        # deadline tests. Synthetic status reports never sleep or open a socket.
+        self._clock_now=time.monotonic()
+        def advance(delay):self._clock_now+=delay
+        self.app_clock=SimpleNamespace(monotonic=lambda:self._clock_now,
+            perf_counter=lambda:self._clock_now,sleep=advance)
+        self.enterContext(patch.object(app,'time',self.app_clock))
+        self.probe_observation=online();self.logout_confirmation=confirmation('offline')
+        def probe(wifi,reader,*args,**kwargs):
+            self.assertEqual(wifi,self.wifi)
+            try:reader()
+            except RuntimeError:return dict(unknown(),detail='network_context_changed')
+            return deepcopy(self.probe_observation)
+        def confirm(wifi,reader,*args,**kwargs):
+            self.assertEqual(wifi,self.wifi)
+            try:reader()
+            except RuntimeError:
+                result=confirmation('unknown');result['status']['detail']='network_context_changed';return result
+            self.assertTrue(callable(kwargs.get('list_devices')),'Confirmation lost the account-scoped read callback')
+            self.assertGreater(kwargs['deadline'],self.app_clock.monotonic())
+            self.assertLessEqual(kwargs['deadline']-self.app_clock.monotonic(),6.0)
+            return deepcopy(self.logout_confirmation)
+        self.bounded_probe=self.enterContext(patch.object(app.status_checks,'probe',side_effect=probe))
+        self.bounded_confirm=self.enterContext(patch.object(app.status_checks,'confirm_logout',side_effect=confirm))
+
         self.client.save_profile=MagicMock(return_value={'ok':True})
         self.client.window=MagicMock();self.client.window.native=None
         self.native_result=True
@@ -81,7 +119,7 @@ class LogoutRecoveryFixture(unittest.TestCase):
             result=trigger()
             if result['ok']:
                 self.assertTrue(self.client.busy)
-                self.assertEqual(thread.call_count,1,'An action spawned result-verification work')
+                self.assertEqual(thread.call_count,1,'An action spawned an additional background worker')
                 thread.call_args.kwargs['target']()
             else:thread.assert_not_called()
         self.assertFalse(self.client.busy)
@@ -90,14 +128,17 @@ class LogoutRecoveryFixture(unittest.TestCase):
         return self.execute(lambda:self.client.logout(account,password,'own-profile'))
 
 class SelfServiceOnlyLogoutTests(LogoutRecoveryFixture):
-    def test_one_service_submission_and_no_portal_or_effect_queries(self):
+    def test_one_service_submission_then_bounded_confirmation_without_legacy_queries(self):
         self.assertTrue(self.logout()['ok'])
         self.assertEqual(self.web.login_calls,[(ACCOUNT,PASSWORD)])
         self.assertEqual(self.web.submit_calls,1);self.assertEqual(self.web.close_calls,1)
         self.client.run_authentication.assert_not_called();self.status_query.assert_not_called();self.internet.assert_not_called()
         self.assertEqual(self.web.summary['request_accepted'],True)
         self.assertIsNone(self.web.summary['session_removed']);self.assertIsNone(self.web.summary['current_device_offline'])
-        self.assertIn('已提交',self.client.status)
+        self.bounded_confirm.assert_called_once()
+        self.assertTrue(self.client.logout_diagnostic['verification_performed'])
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'confirmed_offline')
+        self.assertEqual(self.client.status,'注销成功')
     def test_typed_credentials_are_not_replaced_by_a_saved_profile(self):
         self.store.selected_profile.reset_mock();self.store.profiles.reset_mock()
         self.logout('fictional-typed-user','fictional-typed-password')
@@ -115,17 +156,21 @@ class SelfServiceOnlyLogoutTests(LogoutRecoveryFixture):
         self.profile['password']=''
         self.execute(self.client.logout);self.service_factory.assert_not_called()
     def test_rejected_ack_does_not_become_success_or_trigger_a_retry(self):
-        self.web.ack=False;self.logout()
+        self.web.ack=False;self.logout_confirmation=confirmation('online');self.logout()
         self.assertEqual(self.web.submit_calls,1);self.assertEqual(self.web.close_calls,1)
         self.assertNotIn('注销成功',self.client.status)
-        self.assertIn('失败',self.client.status)
+        self.assertIn('未成功',self.client.status)
+        self.assertIs(self.client.auth_diagnostic['request_accepted'],False)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'still_online')
     def test_unknown_ack_stays_unknown_and_is_not_retried(self):
-        self.web.ack=None;self.logout()
+        self.web.ack=None;self.logout_confirmation=confirmation('unknown');self.logout()
         self.assertEqual(self.web.submit_calls,1);self.assertEqual(self.web.close_calls,1)
-        self.assertIn('未知',self.client.status)
+        self.assertIn('无法确认',self.client.status)
+        self.assertIsNone(self.client.auth_diagnostic['request_accepted'])
         self.assertNotIn('注销成功',self.client.status)
     def test_no_matching_device_does_not_start_another_strategy(self):
-        self.web.submit_error=service.NoMatchingDevice('Fictional no current device');self.logout()
+        self.web.submit_error=service.NoMatchingDevice('Fictional no current device')
+        self.web.summary['device_queries']=1;self.probe_observation=offline();self.logout()
         self.assertEqual(self.web.submit_calls,1);self.assertEqual(self.web.close_calls,1)
         self.client.run_authentication.assert_not_called()
         self.assertNotIn('注销成功',self.client.status)
@@ -146,9 +191,11 @@ class SelfServiceOnlyLogoutTests(LogoutRecoveryFixture):
     def test_state_polling_has_no_network_side_effects(self):
         for _ in range(10):self.client.get_state()
         self.reader.assert_not_called();self.status_query.assert_not_called();self.internet.assert_not_called();self.service_factory.assert_not_called()
+        self.bounded_probe.assert_not_called();self.bounded_confirm.assert_not_called()
     def test_only_user_requested_action_is_exposed_on_the_bridge(self):
         bridge=app.Bridge(self.client)
-        for name in ('cancel_operation','refresh_status','network_check'):
+        self.assertTrue(callable(bridge.refresh_status))
+        for name in ('cancel_operation','network_check'):
             self.assertFalse(hasattr(bridge,name),name)
     def test_wifi_monitor_does_not_schedule_a_status_or_result_check(self):
         self.client.poll_wifi=MagicMock(side_effect=self.client.closed.set)

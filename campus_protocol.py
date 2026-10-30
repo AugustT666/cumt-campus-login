@@ -314,6 +314,25 @@ def _result(data):
     return None
 
 
+def portal_response_outcome(result, response):
+    """Classify explicit portal login replies without changing the raw result.
+
+    Codes 2 and 8 are documented by the school's portal as already-online and
+    authentication timeout. Neither says that the newly entered account was
+    authenticated. Unknown codes and noncanonical values stay unclassified.
+    """
+    if result is not False or not isinstance(response, dict):
+        return None
+    value, code = response.get('result'), response.get('ret_code')
+    if not ((type(value) is int and value == 0) or (type(value) is str and value == '0')):
+        return None
+    if type(code) is int:
+        return {2: 'already_online', 8: 'authentication_timeout'}.get(code)
+    if type(code) is str:
+        return {'2': 'already_online', '8': 'authentication_timeout'}.get(code)
+    return None
+
+
 def decode_portal_message(value, ret_code):
     """Decode only the message branches encoded by the original portal script.
 
@@ -833,6 +852,10 @@ class Engine:
             result = _result(data)
             trace.update(phase='response_received' if result is not None else 'response_unconfirmed',
                          http_status=status, result=result)
+            if operation == 'login':
+                outcome = portal_response_outcome(result, data)
+                if outcome is not None:
+                    trace['response_outcome'] = outcome
             if data is not None:
                 trace['response'] = {key: self._redact(
                                      decode_portal_message(data[key], data.get('ret_code'))

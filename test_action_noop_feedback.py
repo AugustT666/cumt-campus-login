@@ -1,6 +1,6 @@
-"""Portal already-online and account-scoped no-session replies are not failures.
+"""Already-online and no-session replies require bounded current-device evidence.
 
-Every endpoint and credential is synthetic. Shared fixtures poison status,
+Every endpoint and credential is synthetic. Shared fixtures poison legacy status,
 connectivity, developer readback helpers and all real socket connections.
 """
 from copy import deepcopy
@@ -11,11 +11,11 @@ import unittest
 import campus_app as app
 import campus_core as core
 import campus_selfservice as service
-from test_logout_recovery import LogoutRecoveryFixture, ACCOUNT, PASSWORD
+from test_logout_recovery import LogoutRecoveryFixture, ACCOUNT, PASSWORD, online, offline, unknown, confirmation
 
 
-ALREADY_ONLINE='当前设备已在线，本次未重新登录；如需切换账号，请先用原账号注销。'
-NO_SESSION='该账号下未发现本机在线会话，未发送注销请求。'
+ALREADY_ONLINE='当前设备已登录，无需重复登录。'
+NO_SESSION='当前设备已下线，无需重复注销。'
 
 
 class AlreadyOnlineClassificationTests(unittest.TestCase):
@@ -56,6 +56,7 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
     def arrange_no_session(self):
         self.web.summary['device_queries']=1
         self.web.submit_error=service.NoMatchingDevice('Fictional unmatched current device')
+        self.probe_observation=offline()
 
     def test_repeated_login_preserves_received_acceptance_and_original_identity(self):
         self.login()
@@ -65,7 +66,7 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
         self.assertEqual(self.client.status,ALREADY_ONLINE)
         self.assertTrue(self.client.logged_in)
         self.assertEqual(self.client.online_account,ACCOUNT)
-        self.assertEqual(self.client.identity_source,'request_ack')
+        self.assertEqual(self.client.identity_source,'verified_status')
         self.assertIs(self.client.auth_diagnostic['request_accepted'],False)
         self.assertEqual(self.client.auth_diagnostic['response_outcome'],'already_online')
         self.assertEqual(self.client.run_authentication.call_count,2)
@@ -75,15 +76,16 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
         self.login()
         self.arrange_already_online()
         self.login('fictional-different-account')
-        self.assertEqual(self.client.status,ALREADY_ONLINE)
+        self.assertIn('其他账号',self.client.status)
         self.assertEqual(self.client.online_account,ACCOUNT)
         self.assertNotEqual(self.client.online_account,'fictional-different-account')
         self.assertIs(self.client.auth_diagnostic['request_accepted'],False)
 
     def test_fresh_app_already_online_reply_does_not_invent_account_identity(self):
+        self.probe_observation=unknown()
         self.arrange_already_online()
         self.login()
-        self.assertEqual(self.client.status,ALREADY_ONLINE)
+        self.assertIn('无法确认',self.client.status)
         self.assertEqual(self.client.online_account,'')
         self.assertNotEqual(self.client.identity_source,'request_ack')
         self.assertEqual(self.client.session_state,'unknown')
@@ -108,6 +110,7 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
             self.client.message('认证提示：Mac, IP, NASip, PORT err(2)!')
             return False
         self.client.run_authentication.side_effect=rejected
+        self.probe_observation=offline()
         self.login()
         self.assertIn('登录失败',self.client.status)
         self.assertNotIn('response_outcome',self.client.auth_diagnostic)
@@ -117,6 +120,7 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
     def test_old_network_already_online_reply_cannot_replace_current_feedback(self):
         newer=replace(self.wifi,ip='10.61.55.10')
         def changed():
+            self.current=newer
             self.client._observe_portal_network(newer)
             self.client.wifi=newer
             self.client.status='Fictional newer-network feedback'
@@ -130,8 +134,9 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
         self.arrange_no_session()
         self.logout()
         self.assertEqual(self.client.status,NO_SESSION)
-        self.assertEqual(self.client.logout_diagnostic['outcome'],'no_matching_session')
-        self.assertEqual(self.client.auth_diagnostic['phase'],'no_matching_session')
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'confirmed_offline')
+        self.assertTrue(self.client.logout_diagnostic['no_matching_session'])
+        self.assertEqual(self.client.auth_diagnostic['phase'],'confirmed_offline')
         self.assertIsNone(self.client.auth_diagnostic['request_accepted'])
         self.assertEqual(self.web.summary['disconnect_requests'],0)
         self.assertEqual(self.web.close_calls,1)
@@ -141,20 +146,25 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
     def test_unmatched_account_does_not_mark_other_account_offline_or_scan_profiles(self):
         self.login()
         old_identity=(self.client.session_state,self.client.logged_in,self.client.online_account,
-                      self.client.identity_source,self.client.auth_key,deepcopy(self.client.session_diagnostic))
+                      self.client.identity_source,self.client.auth_key)
         self.store.selected_profile.reset_mock();self.store.profiles.reset_mock()
         self.arrange_no_session()
+        self.probe_observation=online();self.logout_confirmation=confirmation('online')
         self.logout('fictional-different-account',PASSWORD)
-        self.assertEqual(self.client.status,NO_SESSION)
+        self.assertIn('在线账号与填写账号不同',self.client.status)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'account_mismatch')
         self.assertEqual((self.client.session_state,self.client.logged_in,self.client.online_account,
-                          self.client.identity_source,self.client.auth_key,self.client.session_diagnostic),old_identity)
+                          self.client.identity_source,self.client.auth_key),old_identity)
         self.assertEqual(self.web.login_calls,[('fictional-different-account',PASSWORD)])
+        self.assertEqual(self.web.submit_calls,1)
+        self.assertEqual(self.web.summary['disconnect_requests'],0)
         self.store.selected_profile.assert_not_called();self.store.profiles.assert_not_called()
 
     def test_no_match_after_context_change_cannot_overwrite_current_network(self):
         self.arrange_no_session()
         def changed():
             newer=replace(self.wifi,ip='10.61.55.10')
+            self.current=newer
             self.client._observe_portal_network(newer)
             self.client.wifi=newer
             self.client.status='Fictional newer-network feedback'
@@ -167,7 +177,7 @@ class ActionNoopFeedbackTests(LogoutRecoveryFixture):
         self.web.submit_current=no_match
         self.logout()
         self.assertEqual(self.client.status,'Fictional newer-network feedback')
-        self.assertEqual(self.client.logout_diagnostic['outcome'],'no_matching_session')
+        self.assertEqual(self.web.summary['disconnect_requests'],0)
         self.assertFalse(self.client.auth_diagnostic['response_context_current'])
 
     def test_unknown_or_already_sent_lookup_errors_remain_errors(self):

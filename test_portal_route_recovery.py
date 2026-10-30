@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import campus_app as app
 import campus_core as core
-from test_logout_recovery import LogoutRecoveryFixture, ACCOUNT, PASSWORD
+from test_logout_recovery import LogoutRecoveryFixture, ACCOUNT, PASSWORD, offline
 
 
 class PortalRouteRecoveryTests(LogoutRecoveryFixture):
@@ -36,13 +36,13 @@ class PortalRouteRecoveryTests(LogoutRecoveryFixture):
 
     def test_rejection_is_committed_before_releasing_cache_without_changing_scope(self):
         self.arrange_reply()
-        commit=self.client._commit_request_result_locked
+        commit=self.client._commit_observed_state_locked
         observed=[]
         def commit_observer(*args,**kwargs):
             observed.append((self.client._engine,self.client.portal_key,self.client._portal_discovered))
             self.assertIs(self.client.auth_diagnostic['request_accepted'],False)
             return commit(*args,**kwargs)
-        self.client._commit_request_result_locked=commit_observer
+        self.client._commit_observed_state_locked=commit_observer
         self.login()
         self.assertEqual(observed,[(self.stale_engine,self.wifi.key,True)])
         self.assertIsNone(self.client._engine)
@@ -130,15 +130,27 @@ class PortalRouteRecoveryTests(LogoutRecoveryFixture):
         self.assertNotIn('next_login_rediscovery',self.client.auth_diagnostic)
         self.assertEqual(self.client.status,'Fictional new-network feedback')
 
-    def test_rejection_superseded_during_commit_does_not_release_new_route(self):
+    def test_rejection_superseded_during_verification_does_not_release_new_route(self):
         self.arrange_reply()
-        self.client._commit_request_result_locked=MagicMock(return_value=False)
+        newer=replace(self.wifi,ip='10.61.55.10')
+        fresh_engine=object()
+        def changed_during_probe(*args,**kwargs):
+            self.current=newer
+            self.client._observe_portal_network(newer)
+            self.client.wifi=newer
+            self.client._engine=fresh_engine
+            self.client.portal_key=newer.key
+            self.client._portal_discovered=True
+            self.client.status='Fictional newer verification-scope feedback'
+            return offline()
+        self.bounded_probe.side_effect=changed_during_probe
         self.login()
-        self.assertIs(self.client._engine,self.stale_engine)
-        self.assertEqual(self.client.portal_key,self.wifi.key)
+        self.assertIs(self.client._engine,fresh_engine)
+        self.assertEqual(self.client.portal_key,newer.key)
         self.assertTrue(self.client._portal_discovered)
         self.assertFalse(self.client.auth_diagnostic['response_context_current'])
         self.assertNotIn('next_login_rediscovery',self.client.auth_diagnostic)
+        self.assertEqual(self.client.status,'Fictional newer verification-scope feedback')
 
     def test_closed_app_does_not_discard_route_from_a_late_rejection(self):
         self.arrange_reply(after_reply=self.client.closed.set)

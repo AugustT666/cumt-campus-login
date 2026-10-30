@@ -191,7 +191,7 @@ def main():
         result = json.loads(report_path.read_text('utf-8'))
         assert smoke.returncode == 0 and result['success'] and result['runtime_log_ready'] and result['diagnostic_zip_verified'] and result['window_restore_verified'] and result['online_identity_display'], result
         assert result['ui_logo_loaded'] and result['native_icon']['verified'], 'Runtime branding validation failed'
-        assert result['no_status_actions'] and result['no_status_apis'], 'Retired checking/cancel actions remain exposed'
+        assert result['manual_status_action'] and result['manual_status_api'], 'Manual status action missing or retired cancel/self-test actions remain exposed'
         assert result['native_icon']['asset_sha256'] == before['assets/icon.ico'], 'Runtime ICO differs from source'
     if result.get('ip'):
         result['ip'] = '<wifi-ip>'
