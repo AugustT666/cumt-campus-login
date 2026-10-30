@@ -125,8 +125,16 @@ def authenticate(self,wifi,account,password,operator,operation,tec,*,result_pars
                     protocol.decode_portal_message(data[k],data.get('ret_code')) if k=='msg' else data[k],limit=None)
                     for k in ('result','ret_code','msg','message') if k in data}
                 if evidence is False:
-                    detail=trace['response'].get('msg') or trace['response'].get('message')
-                    if detail: self.message('认证提示：'+detail)
+                    value,code=data.get('result'),data.get('ret_code')
+                    rejected=(type(value) is int and value==0) or (type(value) is str and value=='0')
+                    already=(type(code) is int and code==2) or (type(code) is str and code=='2')
+                    # App presents this exact login reply as already online,
+                    # without claiming that the entered account was accepted.
+                    # Keep its False receipt and avoid flashing the raw error
+                    # before that final feedback. Other rejections stay visible.
+                    if not (operation=='login' and rejected and already):
+                        detail=trace['response'].get('msg') or trace['response'].get('message')
+                        if detail:self.message('认证提示：'+detail)
             return Response(response.status,response_headers,body)
         except Exception as exc:
             if sensitive_phase[0] and not submission_started[0]:

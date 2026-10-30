@@ -114,6 +114,18 @@ def authentication_result(text, url, operation):
     return protocol._result(data) if data is not None else None
 
 
+def login_already_online(result, diagnostic):
+    """Interpret the portal's explicit already-online code without new queries."""
+    if result is not False or not isinstance(diagnostic,dict) or diagnostic.get('operation')!='login':
+        return False
+    response=diagnostic.get('response')
+    if not isinstance(response,dict):return False
+    value,code=response.get('result'),response.get('ret_code')
+    rejected=(type(value) is int and value==0) or (type(value) is str and value=='0')
+    already=(type(code) is int and code==2) or (type(code) is str and code=='2')
+    return rejected and already
+
+
 def student_auth_time_notice(wifi, now=None):
     """Describe the published weekly schedule without guessing server errors."""
     now = now or dt.datetime.now()
@@ -406,7 +418,7 @@ class App:
         log=getattr(self,'runtime_log',None)
         if log is not None:trace=log.sanitize(trace)
         self.auth_diagnostic=trace;self.record('authentication.result',diagnostic=trace)
-        if result is False:
+        if result is False and not login_already_online(result,trace):
             detail=(trace.get('response') or {}).get('msg') or (trace.get('response') or {}).get('message')
             if detail:self.message('认证提示：'+detail)
         return result
@@ -645,23 +657,38 @@ class App:
             action_id=self.operation_id
             result=self.run_authentication(wifi,account,password,effective_operator,'login',tec,check_allowed)
             received=result if result is True or result is False else None
+            already_online=login_already_online(received,self.auth_diagnostic)
             if result is True:reply_text='登录成功'
+            elif already_online:
+                reply_text='当前设备已在线，本次未重新登录；如需切换账号，请先用原账号注销。'
             elif result is False:
                 rejection=self.status if self.status.startswith('认证提示：') else ''
                 reply_text=self.login_failure_message((rejection+' 登录失败，服务器未接受本次请求。').strip(),wifi)
             else:reply_text=self.login_failure_message('登录结果未知，未再次提交，请稍后重试。',wifi)
             log=getattr(self,'runtime_log',None)
             if log is not None:reply_text=log.sanitize(reply_text)
+            rediscover_next_login=False
             with self.lock:
                 current_reply=self._reply_context_current_locked(wifi,token,action_id,'login')
                 if self.operation_id==action_id:
                     self.auth_diagnostic.update(result=received,request_accepted=received,
                                                 response_context_current=current_reply)
+                    if already_online:self.auth_diagnostic['response_outcome']='already_online'
                 if current_reply:
                     current_reply=self._commit_request_result_locked(wifi,received,'login',account,message=reply_text)
                     self.auth_diagnostic['response_context_current']=current_reply
+                    if current_reply and received is False and not already_online:
+                        # Keep this response and its scope intact. A later
+                        # explicit login must rediscover even if the connection
+                        # is unchanged and discovery previously fell back to a
+                        # portal URL without fresh NAS/AC parameters.
+                        self._engine=None;self._portal_discovered=False;self.portal_key=None
+                        self.auth_diagnostic['next_login_rediscovery']=True
+                        rediscover_next_login=True
             self.record('authentication.reply_received',operation_id=action_id,operation='login',
                         request_accepted=received,response_context_current=current_reply)
+            if rediscover_next_login:
+                self.record('portal.route_cache_discarded',operation_id=action_id,reason='login_rejected')
             if not current_reply:return
             self.record('app.message',operation_id=action_id,text=reply_text)
         return self.start_job('login',job,automatic=automatic)
@@ -799,9 +826,35 @@ class App:
                     self.session_cookies=[]
                 self.record('app.message',operation_id=action_id,text=reply_text)
             except Exception as exc:
-                self.logout_diagnostic.update(outcome='error',error_type=type(exc).__name__)
-                self.record_exception('logout.error',exc)
-                self.message(str(exc) if isinstance(exc,(selfservice.SelfServiceError,RuntimeError)) else '自助服务连接失败，未重复提交。')
+                summary=client.safe_summary() if client is not None else {}
+                no_session=(isinstance(exc,selfservice.NoMatchingDevice)
+                            and summary.get('login_confirmed') is True
+                            and type(summary.get('device_queries')) is int and summary['device_queries']>0
+                            and type(summary.get('disconnect_requests')) is int and summary['disconnect_requests']==0)
+                if no_session:
+                    reply_text='该账号下未发现本机在线会话，未发送注销请求。'
+                    log=getattr(self,'runtime_log',None)
+                    if log is not None:reply_text=log.sanitize(reply_text)
+                    with self.lock:
+                        current_reply=self._reply_context_current_locked(wifi,token,action_id,'logout')
+                        if self.operation_id==action_id:
+                            self.logout_diagnostic.update(outcome='no_matching_session')
+                            self.auth_diagnostic.update(result=None,request_accepted=None,
+                                response_context_current=current_reply,response_outcome='no_matching_session')
+                        if current_reply:
+                            # An account-scoped absence says nothing about an
+                            # existing session under a different account.
+                            self.status=reply_text
+                            self.messages.append({'time':dt.datetime.now().strftime('%H:%M:%S'),'text':reply_text})
+                            self.messages=self.messages[-60:]
+                            self._cache_ui_state_locked()
+                    self.record('logout.no_matching_session',operation_id=action_id,
+                                response_context_current=current_reply,disconnect_requests=0)
+                    if current_reply:self.record('app.message',operation_id=action_id,text=reply_text)
+                else:
+                    self.logout_diagnostic.update(outcome='error',error_type=type(exc).__name__)
+                    self.record_exception('logout.error',exc)
+                    self.message(str(exc) if isinstance(exc,(selfservice.SelfServiceError,RuntimeError)) else '自助服务连接失败，未重复提交。')
             finally:
                 if client is not None:
                     try:client.close()
