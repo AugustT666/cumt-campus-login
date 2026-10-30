@@ -12,7 +12,7 @@
 <div class="field-wrap" id="operator-wrap"><label class="field" for="operator">登录网络</label><select id="operator"><option value="">请选择</option><option value="telecom">中国电信</option><option value="unicom">中国联通</option><option value="cmcc">中国移动</option><option value="campus">校园网</option></select></div>
 <div class="row"><div><span class="label">连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出</span><span class="note">连接后弹出；有已保存账号时自动尝试一次</span></div><button id="startup" class="switch" role="switch" aria-checked="false" aria-label="连接校园网（CUMT_Stu/CUMT_Tec）时自动弹出" onclick="changeStartup()"></button></div>
 <div class="status" id="status" aria-live="polite" tabindex="0" aria-label="运行状态">请连接 CUMT_Stu 或 CUMT_Tec</div><div class="session-actions"><button class="primary" id="login-button" onclick="toggleLogin()">登录</button><button class="plain" id="logout-button" onclick="logoutSession()" disabled>注销</button></div>
-<footer><button class="link" onclick="showHelp()">帮助</button><a class="link" id="session-recovery" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer" aria-label="打开校园网自助服务" hidden>自助服务</a><span id="version">v1.8.2</span><button class="link" onclick="quitApp()">退出</button></footer>
+<footer><button class="link" onclick="showHelp()">帮助</button><a class="link" id="session-recovery" href="http://202.119.196.6:8080/Self/dashboard" target="_blank" rel="noopener noreferrer" aria-label="打开校园网自助服务" hidden>自助服务</a><span id="version">v1.8.3</span><button class="link" onclick="quitApp()">退出</button></footer>
 </main>
 <dialog id="help"><h2>使用帮助</h2>
 <div class="help-line">连接 <b>CUMT_Stu</b> 后填写账号密码并选择网络；<b>CUMT_Tec</b> 无需选择。可点“检测状态”查看当前登录状态。注销时请填写对应账号和密码，程序会短时确认结果；切换账号前先注销。</div>

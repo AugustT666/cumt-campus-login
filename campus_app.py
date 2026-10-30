@@ -355,6 +355,30 @@ class App:
             if (self._portal_network_context(wifi),getattr(self,'_portal_route_generation',0))!=expected:
                 raise RuntimeError('无线连接上下文已改变，已停止本次操作；未重用旧接入设备参数。')
 
+    def _portal_access_context_complete(self,wifi,portal=None):
+        """Classify route quality only; this never authorizes self-service POD."""
+        portal=self.portal if portal is None else portal
+        if (not isinstance(portal,str) or len(portal)>8192
+                or any(ord(ch)<32 or ord(ch)==127 for ch in portal)):return False
+        try:
+            core.portal_origin(portal)
+            fields=core.parse_qsl(urlsplit(portal).query,keep_blank_values=True,
+                strict_parsing=True,max_num_fields=128,encoding='utf-8',errors='strict')
+            values={}
+            required={'wlanuserip','mac','wlanacname','nasip'}
+            for key,value in fields:
+                key=key.casefold()
+                if key in required:
+                    if key in values:return False
+                    values[key]=value
+            return (set(values)==required and bool(core.usable_ipv4(values['nasip']))
+                and protocol._session_ip(values['wlanuserip'])==protocol._session_ip(wifi.ip)
+                and bool(protocol._session_ip(wifi.ip))
+                and bool(protocol._session_mac(wifi.mac))
+                and protocol._session_mac(values['mac'])==protocol._session_mac(wifi.mac)
+                and bool(protocol._portal_parameters(portal).get('wlanacname','').strip()))
+        except (ValueError,UnicodeError,protocol.UnsupportedPortal):return False
+
 
     def session_engine(self,wifi,tec,discover=False):
         """Cache no credentials; a new connection/IP always gets fresh context."""
@@ -364,10 +388,17 @@ class App:
         token=self._observe_portal_network(wifi)
         hint=self.settings.get('portal_hint','')
         if discover and (self.portal_key!=wifi.key or not getattr(self,'_portal_discovered',False)):
+            previous=(self.portal if self.portal_key==wifi.key
+                      and self._portal_access_context_complete(wifi) else '')
             self.record('portal.discovery_started',wifi=core.asdict(wifi))
             portal,_=core.discover(wifi,hint,
                                    reader=lambda:self.checked_wifi(wifi,tec),allow_tec=tec)
             self._assert_portal_route(wifi,token)
+            if (previous and not self._portal_access_context_complete(wifi,portal)
+                    and core.portal_origin(previous)==core.portal_origin(portal)
+                    and urlsplit(previous).path==urlsplit(portal).path):
+                portal=previous
+                self.record('portal.access_context_retained',reason='incomplete_rediscovery')
             self.portal=portal
             self.portal_key=wifi.key
             self._portal_discovered=True
@@ -685,12 +716,14 @@ class App:
                 reply_text=self.login_failure_message(('认证提示：'+detail+' ' if detail else '')+
                             '登录失败，服务器未接受本次请求。',wifi)
             elif state=='offline':
-                reply_text='登录未完成，当前设备未登录，请稍后重试。'
+                reply_text=('学校登录记录暂不一致，当前设备未登录；建议稍等后再试。'
+                            if outcome=='already_online' else '登录未完成，当前设备未登录，请稍后重试。')
             else:
                 reply_text='暂时无法确认登录结果，请点击检测状态；本次不会自动重试。'
             log=getattr(self,'runtime_log',None)
             if log is not None:reply_text=log.sanitize(reply_text)
             rediscover_next_login=False
+            retain_access_context=False
             with self.lock:
                 current_reply=self._reply_context_current_locked(wifi,token,action_id,'login')
                 if self.operation_id==action_id:
@@ -700,15 +733,25 @@ class App:
                     if outcome:self.auth_diagnostic['response_outcome']=outcome
                 if current_reply:
                     self._commit_observed_state_locked(wifi,observation,reply_text)
-                    if received is False and outcome!='already_online':
-                        self._engine=None;self._portal_discovered=False;self.portal_key=None
+                    complete=self._portal_access_context_complete(wifi)
+                    hard_rejection=received is False and outcome is None
+                    contradictory=(outcome=='already_online' and (state!='online'
+                        or not complete and observation.get('binding')!='mac_verified'))
+                    uncertain_weak_route=(not complete and not confirmed and received is not False)
+                    if hard_rejection or outcome=='authentication_timeout' or contradictory or uncertain_weak_route:
+                        retain_access_context=complete and not hard_rejection
+                        self._engine=None;self._portal_discovered=False
+                        self.portal_key=wifi.key if retain_access_context else None
                         self.auth_diagnostic['next_login_rediscovery']=True
+                        self.auth_diagnostic['access_context_retained']=retain_access_context
                         rediscover_next_login=True
             self.record('authentication.reply_received',operation_id=action_id,operation='login',
                         request_accepted=received,response_context_current=current_reply,
                         verification_performed=True,verified_state=state)
             if rediscover_next_login:
-                self.record('portal.route_cache_discarded',operation_id=action_id,reason='login_rejected')
+                self.record('portal.route_refresh_scheduled',operation_id=action_id,
+                    reason=outcome or ('login_rejected' if received is False else 'unconfirmed_route'),
+                    access_context_retained=retain_access_context)
             if not current_reply:return
             self.record('app.message',operation_id=action_id,text=reply_text)
         return self.start_job('login',job,automatic=automatic)
