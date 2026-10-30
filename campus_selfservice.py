@@ -469,7 +469,10 @@ class SelfServiceClient:
             'web_logout_confirmed':False}
 
     def safe_summary(self):
-        return dict(self._summary)
+        summary = dict(self._summary)
+        if 'matching_counts' in summary:
+            summary['matching_counts'] = dict(summary['matching_counts'])
+        return summary
 
     def _record(self, event, **fields):
         if self.trace is not None:
@@ -682,6 +685,18 @@ class SelfServiceClient:
                 or len({d.user_id for d in devices}) > 1
                 or devices and {d.user_id for d in devices} != {self._owner_id}):
             raise UnsupportedService('自助服务设备归属或会话列表无法确认，未选择设备。')
+        address, mac = _ip(self.wifi.ip), self._mac
+        counts = {
+            'exact_matches': sum(d.ip == address and d.mac == mac for d in devices),
+            'current_ip_matches': sum(d.ip == address for d in devices),
+            'current_mac_matches': sum(d.mac == mac for d in devices),
+            'zero_mac_candidates': sum(d.ip == address and not d.mac for d in devices),
+            'ip_other_mac_matches': sum(d.ip == address and bool(d.mac) and d.mac != mac for d in devices),
+        }
+        # Counts expose which safe selection condition did not match, without
+        # retaining account, device, MAC/IP or disconnect identifiers.
+        self._summary['matching_counts'] = counts
+        self._record('selfservice.device_match_counts', **counts)
         try:
             return select_current_session(devices, self.wifi, session_info)
         except NoMatchingDevice:

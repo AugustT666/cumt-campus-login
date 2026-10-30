@@ -11,7 +11,7 @@ FORBIDDEN_MODULE_ROOTS = {
     'setuptools', 'pkg_resources', 'pefile', 'altgraph',
 }
 REQUIRED_MODULES = {
-    'campus_core', 'campus_protocol', 'campus_logging', 'campus_network', 'campus_browser',
+    'campus_core', 'campus_protocol', 'campus_selfservice', 'campus_status', 'campus_logging', 'campus_network', 'campus_browser',
     'campus_webview2', 'webview.platforms.winforms', 'webview.platforms.edgechromium',
     'pythonnet',
 }

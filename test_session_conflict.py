@@ -1,4 +1,4 @@
-"""Old status snapshots cannot turn the two product actions into query loops."""
+"""Cached identities do not override fresh, bounded device observations."""
 from dataclasses import replace
 import campus_core as core
 from test_logout_recovery import LogoutRecoveryFixture,ACCOUNT,PASSWORD
@@ -12,13 +12,16 @@ class ReplyIdentityTests(LogoutRecoveryFixture):
         self.client.session_diagnostic={'state':'unknown','binding':'conflict','detail':'session_ip_mismatch'}
         self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
         self.client.run_authentication.assert_called_once()
-        self.assertEqual(self.client.identity_source,'request_ack')
+        self.assertEqual(self.client.identity_source,'verified_status')
         self.status_query.assert_not_called()
-    def test_previous_server_identity_is_not_reported_as_the_new_acknowledged_account(self):
+        self.bounded_probe.assert_called_once()
+    def test_new_observation_never_claims_the_entered_account_logged_in_when_another_is_online(self):
         self.client.online_account='fictional-old-server-account';self.client.identity_source='server';self.client.session_state='online'
+        self.probe_observation=dict(self.probe_observation,online_account='fictional-other-online-account')
         self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
-        self.assertEqual(self.client.online_account,ACCOUNT)
-        self.assertEqual(self.client.identity_source,'request_ack')
+        self.assertEqual(self.client.online_account,'fictional-other-online-account')
+        self.assertEqual(self.client.identity_source,'verified_status')
+        self.assertNotIn('登录成功',self.client.status)
     def test_typed_logout_is_not_overridden_by_a_previous_identity(self):
         self.client.online_account='fictional-old-server-account';self.client.identity_source='server';self.client.session_state='online'
         self.logout('fictional-current-input','fictional-current-password')
@@ -26,9 +29,11 @@ class ReplyIdentityTests(LogoutRecoveryFixture):
         self.client.run_authentication.assert_not_called()
     def test_no_completed_logout_callback_launches_new_work(self):
         self.logout()
+        checks=self.bounded_confirm.call_count
         for _ in range(20):self.client.get_state()
         self.assertEqual(self.web.submit_calls,1);self.assertEqual(self.web.close_calls,1)
         self.status_query.assert_not_called();self.internet.assert_not_called()
+        self.assertEqual(checks,1);self.assertEqual(self.bounded_confirm.call_count,checks)
     def test_network_change_discards_cached_acknowledged_identity(self):
         self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
         self.current=replace(self.wifi,ip='10.61.55.10')

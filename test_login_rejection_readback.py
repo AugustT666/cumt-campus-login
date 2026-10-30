@@ -1,9 +1,10 @@
 """Rejected login replies stay replies: no hidden readback, retry or fallback."""
 import campus_core as core
-from test_logout_recovery import LogoutRecoveryFixture,ACCOUNT,PASSWORD
+from test_logout_recovery import LogoutRecoveryFixture,ACCOUNT,PASSWORD,offline
 
 class LoginReplyHandlingTests(LogoutRecoveryFixture):
-    def test_a_rejected_login_does_not_become_a_status_query(self):
+    def test_rejected_login_keeps_its_receipt_after_a_short_status_check(self):
+        self.probe_observation=offline()
         self.native_result=False
         self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
         self.client.run_authentication.assert_called_once()

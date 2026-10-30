@@ -25,8 +25,8 @@ def main():
     verification=start_report('ui')
     html=(ROOT/'campus_ui.html').read_text('utf-8')
     for unwanted in ('热点保护','第三校区','咱俩','聊天','自动弹窗','auto_enabled','auto_submit',
-                     'id="cancel-operation"','id="status-refresh"','id="network-check"',
-                     'function cancelOperation','function refreshStatus','function checkNetwork','cancelBusy'):
+                     'id="cancel-operation"','id="network-check"',
+                     'function cancelOperation','function checkNetwork','cancelBusy'):
         assert unwanted not in html,unwanted
     with sync_playwright() as p:
         browser=p.chromium.launch(channel='msedge',headless=True,args=['--no-proxy-server','--disable-background-networking'])
@@ -49,7 +49,8 @@ def main():
         assert page.locator('#account-switch-note').is_hidden()
         assert page.locator('.session-actions button').all_text_contents()==['登录','注销']
         assert page.locator('#logout-button').is_disabled()
-        assert page.locator('#status-refresh,#network-check,#cancel-operation').count()==0
+        assert page.locator('#network-check,#cancel-operation').count()==0
+        assert page.locator('#status-refresh').inner_text()=='检测状态' and page.locator('#status-refresh').is_disabled()
         assert page.locator('#login-switch,#tec').count()==0
         assert page.locator('#diagnostic-export').inner_text()=='导出诊断包'
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth&&document.documentElement.scrollHeight<=innerHeight')
@@ -65,8 +66,9 @@ def main():
           window.fakeDiagnostic={ok:true,path:'C:/Fake/diagnostic-fake.zip'};
           api={boot:async()=>{window.fakeLog.push(['boot']);return window.fakeData},
             get_state:async()=>{window.fakeLog.push(['get_state']);return window.fakeState},
-            login:async(...args)=>{window.fakeLog.push(['login',...args]);Object.assign(window.fakeState,{identity_source:'request_ack',online_account:args[0],session_state:'online',logged_in:true,status:'本次登录请求已接受'});return {ok:true}},
+            login:async(...args)=>{window.fakeLog.push(['login',...args]);Object.assign(window.fakeState,{identity_source:'verified_status',online_account:args[0],session_state:'online',logged_in:true,status:'登录成功'});return {ok:true}},
             logout:async(...args)=>{window.fakeLog.push(['logout',...args]);Object.assign(window.fakeState,{identity_source:'',online_account:'',session_state:'offline',logged_in:false,status:'本次注销已完成'});return {ok:true}},
+            refresh_status:async(...args)=>{window.fakeLog.push(['status',...args]);Object.assign(window.fakeState,{identity_source:'verified_status',online_account:'checked-account',session_state:'online',logged_in:true,status:'当前设备已登录'});return {ok:true}},
             diagnostic:async()=>{window.fakeLog.push(['diagnostic']);return window.fakeDiagnostic},
             select_profile:async(id)=>{window.fakeLog.push(['select',id]);window.fakeData.selected=id;window.fakeData.account=id==='two'?'fake-second':id?'fake-account':'';window.fakeData.password=id?'fake-password':'';return {ok:true,data:window.fakeData}},
             save_profile:async(...args)=>{window.fakeLog.push(['save',...args]);return {ok:true,data:window.fakeData}},
@@ -84,6 +86,21 @@ def main():
         before=page.evaluate('window.fakeLog.length')
         page.evaluate('Promise.all([refresh(),refresh(),refresh()])')
         assert page.evaluate('window.fakeLog.slice('+str(before)+').every(x=>x[0]==="get_state")')
+        # Status detection is one explicit read-only action, without form data.
+        assert page.locator('#status-refresh').is_enabled()
+        before=page.evaluate('window.fakeLog.length')
+        page.locator('#status-refresh').click();page.wait_for_function("!actionBusy&&window.fakeLog.some(x=>x[0]==='status')")
+        assert page.evaluate("window.fakeLog.filter(x=>x[0]==='status')")==[['status']]
+        assert page.evaluate('window.fakeLog.slice('+str(before)+').every(x=>x[0]==="status"||x[0]==="get_state")')
+        assert page.locator('#online-account').inner_text()=='当前在线账号：checked-account'
+        # The outstanding bridge request locks all three network actions.
+        page.evaluate("() => {window.savedStatus=api.refresh_status;api.refresh_status=(...args)=>new Promise(resolve=>{window.releaseStatus=async()=>resolve(await window.savedStatus(...args))});refreshStatus();}")
+        assert page.locator('#status-refresh').is_disabled() and page.locator('#login-button').is_disabled() and page.locator('#logout-button').is_disabled()
+        before=page.evaluate('window.fakeLog.length');page.evaluate('refreshStatus();toggleLogin();logoutSession()')
+        assert page.evaluate('window.fakeLog.slice('+str(before)+').every(x=>x[0]==="get_state")')
+        page.evaluate('window.releaseStatus()');page.wait_for_function('!actionBusy')
+        page.evaluate('() => {api.refresh_status=window.savedStatus;}')
+        page.evaluate("Object.assign(window.fakeState,{identity_source:'',online_account:'',session_state:'unknown',logged_in:false,status:'请选择账号后登录'});refresh()")
         # Help, advanced address settings, safe external links and diagnostic feedback.
         page.evaluate('showHelp()')
         assert page.locator('#help-advanced').evaluate('(x)=>!x.open')
@@ -92,6 +109,7 @@ def main():
         for retired in ('网络自检','取消操作','后台核对','刷新状态'):
             assert retired not in page.locator('#help').inner_text()
         assert '注销时请填写对应账号和密码' in page.locator('#help').inner_text()
+        assert '检测状态' in page.locator('#help').inner_text() and '短时确认结果' in page.locator('#help').inner_text()
         page.locator('#help-advanced summary').click();page.locator('#portal_hint').fill('http://10.2.5.251/a79.htm')
         page.locator('#portal-save').click();page.wait_for_function("window.fakeLog.some(x=>x[0]==='hint')")
         page.locator('#help-advanced summary').click();assert page.locator('#portal_hint').is_hidden()
@@ -124,7 +142,7 @@ def main():
         assert not page.evaluate("window.fakeLog.some(x=>x[0]==='boot')"), 'Accepted login must not overwrite the typed form with old profile data'
         assert page.locator('#account').input_value()=='typed-login-account'
         assert page.locator('#password').input_value()=='typed-login-password'
-        assert page.locator('#online-account').inner_text()=='本次登录账号：typed-login-account'
+        assert page.locator('#online-account').inner_text()=='当前在线账号：typed-login-account'
         # Logout uses the currently typed credentials, regardless of cached offline/unknown.
         page.locator('#account').fill('typed-logout-account');page.locator('#password').fill('typed-logout-password')
         page.evaluate("window.fakeState.session_state='offline';window.fakeState.logged_in=false;refresh()")
@@ -147,19 +165,32 @@ def main():
         page.locator('#save-profile').click();page.wait_for_function("!profileBusy&&window.fakeLog.some(x=>x[0]==='save'&&x[1]==='two')")
         page.locator('#delete-profile').click();assert page.locator('#delete-confirm').is_visible()
         page.locator('#delete-confirm .plain').click();assert not page.evaluate("window.fakeLog.some(x=>x[0]==='delete')")
-        # Identity is an acknowledged action, never a claim from stale server state.
+        # Only verified status describes current identity; receipt history is labelled separately.
         page.evaluate("Object.assign(window.fakeState,{identity_source:'server',online_account:'stale-server-account',session_state:'online',logged_in:true});refresh()")
         assert page.locator('#online-account').inner_text()=='暂无本次登录记录'
         page.evaluate("window.fakeState.identity_source='request_ack';window.fakeState.online_account='acknowledged-account';refresh()")
-        assert page.locator('#online-account').inner_text()=='本次登录账号：acknowledged-account'
+        assert page.locator('#online-account').inner_text()=='本次请求账号：acknowledged-account'
         assert page.locator('#account-switch-note').is_visible()
         page.locator('#account').fill('acknowledged-account');assert page.locator('#account-switch-note').is_hidden()
         page.locator('#account').fill('fake-second')
         page.evaluate("window.fakeState.session_state='unknown';window.fakeState.logged_in=false;refresh()")
-        assert page.locator('#online-account').inner_text()=='本次登录账号：acknowledged-account'
+        assert page.locator('#online-account').inner_text()=='本次请求账号：acknowledged-account'
         page.evaluate("window.fakeState.online_account='<img src=x onerror=window.fakeIdentityInjected=true>';refresh()")
-        assert page.locator('#online-account').inner_text()=='本次登录账号：<img src=x onerror=window.fakeIdentityInjected=true>'
+        assert page.locator('#online-account').inner_text()=='本次请求账号：<img src=x onerror=window.fakeIdentityInjected=true>'
         assert page.locator('#online-account img').count()==0 and not page.evaluate('!!window.fakeIdentityInjected')
+        page.evaluate("Object.assign(window.fakeState,{identity_source:'verified_status',online_account:'verified-account',session_state:'online',logged_in:true});refresh()")
+        assert page.locator('#online-account').inner_text()=='当前在线账号：verified-account'
+        page.locator('#account').fill('verified-account')
+        page.evaluate("window.fakeState.online_account=',0,verified-account@unicom';refresh()")
+        assert page.locator('#account-switch-note').is_hidden(), 'Carrier suffix must not look like another account'
+        page.evaluate("window.fakeState.online_account='verified-account';refresh()")
+
+        page.evaluate("window.fakeState.online_account='';refresh()")
+        assert page.locator('#online-account').inner_text()=='当前设备已登录（账号未确认）'
+        page.evaluate("window.fakeState.session_state='offline';window.fakeState.logged_in=false;refresh()")
+        assert page.locator('#online-account').inner_text()=='当前设备未登录'
+        page.evaluate("window.fakeState.session_state='unknown';window.fakeState.online_account='stale-verified-account';refresh()")
+        assert page.locator('#online-account').inner_text()=='登录状态未确认'
         page.evaluate("window.fakeState.identity_source='';window.fakeState.online_account='';refresh()")
         assert page.locator('#online-account').inner_text()=='暂无本次登录记录'
         assert page.locator('#account-switch-note').is_hidden()
@@ -168,7 +199,7 @@ def main():
             page.evaluate("cached=>{window.fakeState.session_state=cached;refresh()}",cached)
             assert page.locator('#logout-button').is_enabled()
         page.evaluate("window.fakeState.campus=false;window.fakeState.ssid='';refresh()")
-        assert page.locator('#logout-button').is_disabled()
+        assert page.locator('#logout-button').is_disabled() and page.locator('#status-refresh').is_disabled()
         page.evaluate("window.fakeState.campus=true;window.fakeState.ssid='CUMT_Stu';refresh()")
         assert page.locator('#operator-wrap').is_visible()
         # An outstanding login bridge locks both actions and cannot double-submit.
@@ -184,6 +215,8 @@ def main():
         assert page.locator('#profiles').is_disabled()
         page.evaluate("window.fakeState.operation='logout';refresh()")
         assert page.locator('#logout-button').inner_text()=='正在注销…'
+        page.evaluate("window.fakeState.operation='status';refresh()")
+        assert page.locator('#status-refresh').inner_text()=='检测中…' and page.locator('#status-refresh').is_disabled()
         assert page.locator('.session-actions button').count()==2
         page.evaluate("window.fakeState.busy=false;window.fakeState.operation='';refresh()")
         # Auto-popup setting, profile creation/deletion and address trust remain usable.
@@ -235,7 +268,7 @@ def main():
         page.screenshot(path=str(REPORTS/f'登录器_v{c.VERSION}_暂停认证界面.png'),full_page=True)
         page.evaluate('quitApp()');page.wait_for_function("window.fakeLog.some(x=>x[0]==='quit')")
         assert not errors,errors
-        print('all mocked two-action UI interactions passed',flush=True)
+        print('all mocked login/logout and manual status UI interactions passed',flush=True)
         context.close();browser.close()
     import webview
     temporary=tempfile.TemporaryDirectory(dir=REPORTS);store=c.Store(Path(temporary.name))
@@ -256,7 +289,9 @@ def main():
         result['boot_error']=window.evaluate_js('window.clientBootError||null')
         result['startup_switch']=window.evaluate_js("el('startup').getAttribute('role')")
         result['actions']=window.evaluate_js("Array.from(document.querySelectorAll('.session-actions button'),x=>x.textContent)")
-        result['retired_controls_absent']=window.evaluate_js("!document.querySelector('#cancel-operation,#status-refresh,#network-check')")
+        result['retired_controls_absent']=window.evaluate_js("!document.querySelector('#cancel-operation,#network-check')")
+        result['manual_status_control']=window.evaluate_js("el('status-refresh').textContent==='检测状态'&&el('status-refresh').disabled")
+        result['status_method']=window.evaluate_js('typeof window.pywebview.api.refresh_status')
         result['diagnostic_export']=window.evaluate_js("el('diagnostic-export').innerText")
         result['action_identity']=window.evaluate_js("el('online-account').innerText")
         result['logging_isolated']=helper.runtime_log.root==store.root and helper.runtime_log.path.is_file()
@@ -273,13 +308,14 @@ def main():
     assert result['title']==a.TITLE and result['method']=='function' and result['logo_loaded'],result
     assert result['ready'] and result['ssid']==helper.wifi.ssid and result['startup_switch']=='switch',result
     assert result['actions']==['登录','注销'] and result['retired_controls_absent'],result
+    assert result['manual_status_control'] and result['status_method']=='function',result
     assert result['diagnostic_export']=='导出诊断包' and result['logging_isolated'],result
     assert result['action_identity']=='暂无本次登录记录',result
     assert result['snapshot_api_calls']==8 and result['memory_poll_no_wlan_reads'],result
     report={'version':c.VERSION,'compact_ui':True,'no_conversation_copy':True,'webview_result':result,
-            'two_actions_only':True,'typed_logout_parameters':True,'explicit_blank_logout_not_replaced':True,
+            'two_primary_actions_and_manual_status':True,'typed_logout_parameters':True,'explicit_blank_logout_not_replaced':True,
             'memory_snapshot_poll_only':True,'no_user_network_check_controls':True,'busy_locks_both_actions':True,
-            'action_ack_identity_text_only':True,'stale_server_identity_ignored':True,
+            'verified_status_and_ack_identity_distinguished':True,'stale_server_identity_ignored':True,'manual_status_no_authentication':True,'manual_status_busy_guard':True,
             'accepted_login_preserves_typed_form':True,'diagnostic_export_feedback':True,'logging_failure_visible':True,
             'profiles_crud_preserved':True,'automatic_popup_control_preserved':True,
             'concise_help_fits_without_scrolling':True,'advanced_address_settings_collapsible':True,

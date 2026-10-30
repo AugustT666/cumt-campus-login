@@ -199,6 +199,8 @@ class ProfileTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(a.status_checks,'probe',return_value={'state':'offline',
+            'binding':'source_ip_only','matched_ip':True,'mac_conflict':False,'ip_conflict':False}))
         self.enterContext(patch.object(a,'stable_autostart_configured',return_value=False))
         self.enterContext(patch.object(a,'stable_instance_running',return_value=False))
         self.helper=a.App.__new__(a.App)

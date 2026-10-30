@@ -227,7 +227,12 @@ class RuntimeLoggingIntegrationTests(unittest.TestCase):
                     return outcome, trace
                 engine.authenticate.side_effect = fake_authenticate
                 self.client.session_engine = MagicMock(return_value=engine)
-                self.execute(lambda: self.client.login(ACCOUNT, password, 'campus'))
+                observation={'state':'online' if outcome else 'unknown',
+                    'binding':'mac_verified' if outcome else 'unconfirmed',
+                    'matched_ip':True,'mac_conflict':False,'ip_conflict':False,
+                    'online_account':ACCOUNT if outcome else ''}
+                with patch.object(app.status_checks,'probe',return_value=observation):
+                    self.execute(lambda: self.client.login(ACCOUNT, password, 'campus'))
                 engine.prepare.assert_called_once()
                 engine.authenticate.assert_called_once()
                 self.assertEqual(self.client.session_state, 'online' if outcome else 'unknown')

@@ -81,7 +81,7 @@ class ProtocolNetworkFeedbackTests(unittest.TestCase):
         self.assertEqual(len(portal.submissions), 1)
 
 
-from test_logout_recovery import LogoutRecoveryFixture,ACCOUNT,PASSWORD
+from test_logout_recovery import LogoutRecoveryFixture,ACCOUNT,PASSWORD,unknown
 
 class AppNetworkFeedbackTests(LogoutRecoveryFixture):
     def login(self):return self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
@@ -92,10 +92,12 @@ class AppNetworkFeedbackTests(LogoutRecoveryFixture):
         self.assertIn('10013',self.client.status)
         self.assertFalse(self.client.logged_in)
         self.status_query.assert_not_called();self.internet.assert_not_called()
-    def test_unknown_reply_after_one_attempt_is_not_retried_or_rechecked(self):
+    def test_unknown_reply_after_one_attempt_is_checked_but_never_retried(self):
+        self.probe_observation=unknown()
         self.native_result=None;self.login()
         self.client.run_authentication.assert_called_once()
-        self.assertIn('未知',self.client.status)
+        self.assertIn('无法确认',self.client.status)
+        self.assertIsNone(self.client.auth_diagnostic['request_accepted'])
         self.status_query.assert_not_called();self.internet.assert_not_called()
     def test_worker_error_is_retained_without_an_automatic_recovery_action(self):
         self.client.run_authentication.side_effect=RuntimeError('Fictional transport rejection')

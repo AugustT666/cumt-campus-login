@@ -4,6 +4,8 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
@@ -36,6 +38,18 @@ class AppHardeningTests(unittest.TestCase):
         self.client.session_engine = MagicMock(return_value=self.engine)
         self.client.run_authentication = MagicMock(return_value=True)
         self.client.save_profile = MagicMock(return_value={'ok': True})
+        self._now = time.monotonic()
+        self.clock = SimpleNamespace(monotonic=lambda:self._now,perf_counter=lambda:self._now,
+            sleep=lambda delay:setattr(self,'_now',self._now+delay))
+        self.enterContext(patch.object(app,'time',self.clock))
+        self.observation = {'state':'online','binding':'mac_verified','matched_ip':True,
+            'mac_conflict':False,'ip_conflict':False,'online_account':ACCOUNT,
+            'server_mac':'001122334455','server_ip':WIFI.ip,'verification_performed':True}
+        def bounded_probe(wifi,reader,**kwargs):
+            self.assertEqual(wifi,WIFI)
+            reader()
+            return dict(self.observation)
+        self.bounded_probe = self.enterContext(patch.object(app.status_checks,'probe',side_effect=bounded_probe))
         def execute_job(kind,job,automatic=False):
             with patch.object(app.threading,'Thread') as thread:
                 result=app.App.start_job(self.client,kind,job,automatic)
@@ -69,37 +83,39 @@ class AppHardeningTests(unittest.TestCase):
         self.client.run_authentication.assert_not_called()
         self.assertTrue(self.client.on_closing())
 
-    def test_success_ack_records_receipt_without_status_or_effect_probes(self):
+    def test_success_ack_is_separate_from_the_bounded_verified_state(self):
         self.login()
         self.assertTrue(self.client.logged_in)
         self.assertEqual(self.client.session_state, 'online')
-        self.assertEqual(self.client.session_diagnostic['source'], 'request_ack')
-        self.assertFalse(self.client.session_diagnostic['verification_performed'])
+        self.assertEqual(self.client.session_diagnostic['source'], 'portal_query')
+        self.assertTrue(self.client.session_diagnostic['verification_performed'])
         self.assertIn('登录成功', self.client.status)
         self.client.run_authentication.assert_called_once()
         self.engine.status.assert_not_called()
         self.probes.assert_not_called()
+        self.bounded_probe.assert_called_once()
 
-    def test_rejected_and_unknown_acks_do_not_request_readback_or_claim_success(self):
+    def test_rejected_and_unknown_acks_keep_receipts_without_fabricating_online_state(self):
+        self.observation.update(state='unknown',binding='unconfirmed',matched_ip=False,online_account='')
         for result in (False,None):
             with self.subTest(result=result):
                 self.client.run_authentication.return_value=result
                 self.login()
                 self.assertFalse(self.client.logged_in)
                 self.assertEqual(self.client.session_state, 'unknown')
-                self.assertIn('失败' if result is False else '未知', self.client.status)
+                self.assertIn('失败' if result is False else '无法确认', self.client.status)
                 self.assertNotIn('登录成功',self.client.status)
                 self.assertIs(self.client.auth_diagnostic['request_accepted'],result)
         self.assertEqual(self.client.run_authentication.call_count, 2)
         self.engine.status.assert_not_called()
         self.probes.assert_not_called()
 
-    def test_success_receipt_identity_is_submitted_account_not_server_observation(self):
+    def test_success_identity_comes_from_the_server_observation(self):
         self.login()
         self.assertTrue(self.client.logged_in)
         self.assertEqual(self.client.online_account, ACCOUNT)
-        self.assertEqual(self.client.identity_source,'request_ack')
-        self.assertNotEqual(self.client.identity_source,'server')
+        self.assertEqual(self.client.identity_source,'verified_status')
+        self.assertNotEqual(self.client.identity_source,'request_ack')
         self.engine.status.assert_not_called()
         self.probes.assert_not_called()
 

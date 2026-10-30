@@ -1,4 +1,4 @@
-"""A received reply is not replaced by a later native-read failure.
+"""A received reply is retained while bounded effect checks determine state.
 
 All endpoints, identities and services are synthetic; socket access is denied
 by the shared fixture. Context changes are represented by retained state only.
@@ -31,7 +31,7 @@ class SimpleReplyScopeTests(LogoutRecoveryFixture):
             return self.execute(lambda:self.client.login(ACCOUNT,PASSWORD,'campus','own-profile'))
         return self.logout()
 
-    def no_native_read_after_reply(self, operation, reply=True):
+    def status_read_failure_after_reply(self, operation, reply=True):
         after=[False]
         reads_at_reply=[]
         self.native_result=reply
@@ -45,27 +45,32 @@ class SimpleReplyScopeTests(LogoutRecoveryFixture):
             return self.current
         self.reader.side_effect=read
         self.assertTrue(self.action(operation)['ok'])
-        self.assertEqual(self.reader.call_count,reads_at_reply[0])
+        self.assertGreater(self.reader.call_count,reads_at_reply[0])
         self.assertIs(self.client.auth_diagnostic['result'],reply)
         self.assertIs(self.client.auth_diagnostic['request_accepted'],reply)
         self.assertTrue(self.client.auth_diagnostic['response_context_current'])
         self.assertNotIn('Fictional native failure',self.client.status)
+        self.assertFalse(self.client.logged_in)
+        self.assertEqual(self.client.session_state,'unknown')
+        self.assertNotIn('登录成功',self.client.status)
+        self.assertNotIn('注销成功',self.client.status)
+        self.assertNotIn('正在确认',self.client.status)
 
-    def test_login_success_does_not_wait_for_another_native_read(self):
-        self.no_native_read_after_reply('login')
-        self.assertEqual(self.client.status,'登录成功')
-        self.assertTrue(self.client.logged_in)
+    def test_login_success_receipt_survives_unreadable_status_without_false_success(self):
+        self.status_read_failure_after_reply('login')
+        self.assertIn('无法确认',self.client.status)
 
-    def test_selfservice_success_does_not_wait_for_another_native_read(self):
-        self.no_native_read_after_reply('logout')
-        self.assertEqual(self.client.status,'注销请求已提交')
-        self.assertEqual(self.client.logout_diagnostic['outcome'],'acknowledged')
+    def test_selfservice_success_receipt_survives_unreadable_status_without_false_success(self):
+        self.status_read_failure_after_reply('logout')
+        self.assertIn('无法确认',self.client.status)
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'unknown')
         self.assertEqual(self.web.close_calls,1)
+        self.assertEqual(self.web.summary['disconnect_requests'],1)
 
-    def test_login_rejected_and_unknown_replies_do_not_trigger_native_checks(self):
+    def test_login_rejected_and_unknown_receipts_survive_failed_native_checks(self):
         for reply in (False,None):
             with self.subTest(reply=reply):
-                self.no_native_read_after_reply('login',reply)
+                self.status_read_failure_after_reply('login',reply)
                 self.assertFalse(self.client.logged_in)
                 # Restore the fixture's authentication callback for the next
                 # explicit request rather than layering two reply observers.
@@ -100,7 +105,7 @@ class SimpleReplyScopeTests(LogoutRecoveryFixture):
 
     def test_old_logout_reply_cannot_mark_new_network_offline(self):
         self.changed_context_preserves_ack('logout')
-        self.assertEqual(self.client.logout_diagnostic['outcome'],'acknowledged')
+        self.assertEqual(self.web.summary['disconnect_requests'],1)
 
     def closed_context_preserves_ack(self,operation):
         def closed():
@@ -126,10 +131,10 @@ class SimpleReplyScopeTests(LogoutRecoveryFixture):
             raise RuntimeError('Fictional cleanup logging failure')
         self.web.close=cleanup_error
         self.logout()
-        self.assertEqual(self.client.status,'注销请求已提交')
+        self.assertEqual(self.client.status,'注销成功')
         self.assertIs(self.client.auth_diagnostic['result'],True)
         self.assertIs(self.client.auth_diagnostic['request_accepted'],True)
-        self.assertEqual(self.client.logout_diagnostic['outcome'],'acknowledged')
+        self.assertEqual(self.client.logout_diagnostic['outcome'],'confirmed_offline')
         self.assertEqual(self.web.summary['disconnect_requests'],1)
 
     def test_context_change_during_reply_sanitizing_cannot_publish_old_feedback(self):

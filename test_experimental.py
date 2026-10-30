@@ -138,6 +138,9 @@ class ExperimentalCoexistenceTests(unittest.TestCase):
                               '10.52.7.23', '00-11-22-33-44-55')
         self.client.wifi = self.wifi
         self.enterContext(patch.object(core, 'read_wifi', return_value=self.wifi))
+        self.enterContext(patch.object(app.status_checks,'probe',return_value={
+            'state':'online','binding':'mac_verified','matched_ip':True,'mac_conflict':False,
+            'ip_conflict':False,'online_account':'fictional-user'}))
         self.autostart = self.enterContext(patch.object(app, 'stable_autostart_configured', return_value=False))
         self.running = self.enterContext(patch.object(app, 'stable_instance_running', return_value=False))
         self.client.save_profile = MagicMock(return_value={'ok': True})
